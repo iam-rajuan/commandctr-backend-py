@@ -1,0 +1,2 @@
+ORDERS_COLLECTION = "orders"
+MARKETPLACE_CONNECTIONS_COLLECTION = "marketplaceconnections"

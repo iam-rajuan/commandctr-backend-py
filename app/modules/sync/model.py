@@ -1,0 +1,1 @@
+COLLECTION = "sync_logs"

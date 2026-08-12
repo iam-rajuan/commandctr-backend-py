@@ -1,0 +1,4 @@
+PRODUCTS_COLLECTION = "products"
+ORDERS_COLLECTION = "orders"
+INVENTORY_COLLECTION = "inventories"
+SYNC_LOGS_COLLECTION = "sync_logs"
