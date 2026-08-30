@@ -14,7 +14,7 @@ The migration keeps the same environment variable names as the Node backend. Use
 ## Run
 
 ```powershell
-uv run uvicorn app.main:app --host 0.0.0.0 --port 5000 --reload
+uv run uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
 ```
 
 ## Test And Validate
