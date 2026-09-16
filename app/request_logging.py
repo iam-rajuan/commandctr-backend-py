@@ -1,23 +1,40 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from fastapi import Request
 
 MAX_LOGGED_BODY_CHARS = 3000
+RESET = "\033[0m"
+BOLD = "\033[1m"
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+MAGENTA = "\033[95m"
+YELLOW = "\033[93m"
+GRAY = "\033[90m"
+RED = "\033[91m"
 SENSITIVE_KEYS = {
     "access_token",
     "accesstoken",
     "authorization",
     "client_secret",
     "clientsecret",
+    "code",
+    "hmac",
     "password",
     "refresh_token",
     "refreshtoken",
     "secret",
+    "signature",
+    "state",
     "token",
 }
+JSON_TOKEN_PATTERN = re.compile(
+    r'("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false)\b|\bnull\b|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b'
+)
 
 
 def _mask_sensitive(value: Any) -> Any:
@@ -40,6 +57,25 @@ def _truncate(value: Any) -> Any:
     if len(text) <= MAX_LOGGED_BODY_CHARS:
         return value
     return f"{text[:MAX_LOGGED_BODY_CHARS]}... <truncated>"
+
+
+def _color_json(value: Any) -> str:
+    text = json.dumps(value, default=str, ensure_ascii=False, indent=2)
+
+    def replace(match: re.Match[str]) -> str:
+        json_string, key_suffix, boolean = match.group(1), match.group(2), match.group(3)
+        token = match.group(0)
+        if json_string and key_suffix:
+            return f"{CYAN}{json_string}{RESET}{key_suffix}"
+        if json_string:
+            return f"{GREEN}{json_string}{RESET}"
+        if boolean:
+            return f"{MAGENTA}{boolean}{RESET}"
+        if token == "null":
+            return f"{GRAY}{token}{RESET}"
+        return f"{YELLOW}{token}{RESET}"
+
+    return JSON_TOKEN_PATTERN.sub(replace, text)
 
 
 async def read_payload_for_log(request: Request) -> Any:
@@ -84,16 +120,16 @@ def print_request_log(
     query: dict[str, Any],
     payload: Any,
 ) -> None:
-    separator = "=" * 88
+    separator = f"{BLUE}{'-' * 88}{RESET}"
     print(
         "\n".join(
             [
                 separator,
-                f"[{service}] {method} {path} -> {status_code} ({duration_ms:.1f} ms)",
-                f"  request_id: {request_id or '-'}",
-                f"  client: {client}",
-                f"  query: {json.dumps(_mask_sensitive(query), default=str, ensure_ascii=False)}",
-                f"  payload: {json.dumps(payload, default=str, ensure_ascii=False)}",
+                f"{BOLD}[{service}]{RESET} {CYAN}{method}{RESET} {path} -> {GREEN if str(status_code).startswith('2') else RED}{status_code}{RESET} ({duration_ms:.1f} ms)",
+                f"{GRAY}request_id:{RESET} {request_id or '-'}",
+                f"{GRAY}client:{RESET} {client}",
+                f"{GRAY}query:{RESET}\n{_color_json(_mask_sensitive(query))}",
+                f"{GRAY}payload:{RESET}\n{_color_json(_mask_sensitive(payload))}",
                 separator,
             ]
         ),

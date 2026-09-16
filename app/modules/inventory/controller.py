@@ -8,6 +8,7 @@ from app.modules.inventory.schema import InventoryUpdateBody, SafetyBufferBody
 router = APIRouter()
 
 
+@router.get("")
 @router.get("/")
 async def get_inventory(includeInactive: str | None = None, user=Depends(current_user)):
     include_inactive = str(includeInactive).lower() == "true"

@@ -15,6 +15,7 @@ async def seed_sandbox(user=Depends(current_user)):
     return success("Sandbox orders created successfully", await service.seed_orders(user["userId"]))
 
 
+@router.get("")
 @router.get("/")
 async def list_orders(
     page: str | None = None,

@@ -13,6 +13,7 @@ async def create_product(body: ProductCreateBody, user=Depends(current_user)):
     return success("Product created successfully", await service.create_product(user["userId"], body))
 
 
+@router.get("")
 @router.get("/")
 async def get_products(user=Depends(current_user)):
     return success("Products fetched successfully", await service.get_products(user["userId"]))
