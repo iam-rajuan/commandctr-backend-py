@@ -5,6 +5,7 @@ FastAPI migration of the original `commandctr-backend` Express/Mongoose API.
 ## Setup
 
 ```powershell
+cd D:\RAJUAN-PERSONAL\VSCODE\commandctr\commandctr-backend-py
 uv sync
 Copy-Item ..\commandctr-backend\.env .\.env
 ```
@@ -13,15 +14,29 @@ The migration keeps the same environment variable names as the Node backend. Use
 
 ## Run
 
+Run on the default Uvicorn port `8000`:
+
 ```powershell
-uv run uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
+uv run python -m uvicorn app.main:app --reload
+```
+
+Run on the project port `9000`:
+
+```powershell
+uv run python -m uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
+```
+
+Health check:
+
+```text
+http://localhost:9000/api/v1/health
 ```
 
 ## Test And Validate
 
 ```powershell
 uv run ruff check .
-uv run pytest
+uv run python -m pytest
 uv run python -m compileall app
 ```
 
@@ -81,7 +96,7 @@ app/
 ```powershell
 uv run python -m compileall app tests
 uv run ruff check .
-uv run pytest -q
+uv run python -m pytest -q
 ```
 
 Startup smoke:
