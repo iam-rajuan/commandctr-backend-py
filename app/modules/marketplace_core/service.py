@@ -5,6 +5,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 from datetime import timedelta
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -106,13 +107,42 @@ async def shopify_access(user_id: str) -> tuple[str, str]:
 async def shopify_graphql(user_id: str, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
     shop, token = await shopify_access(user_id)
     url = f"https://{shop}/admin/api/{get_settings().SHOPIFY_API_VERSION}/graphql.json"
+    response: httpx.Response | None = None
     async with httpx.AsyncClient(timeout=30) as client:
-        res = await client.post(url, headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"}, json={"query": query, "variables": variables or {}})
-    if res.status_code >= 400:
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    url,
+                    headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
+                    json={"query": query, "variables": variables or {}},
+                )
+            except httpx.HTTPError as exc:
+                if attempt == 2:
+                    raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Shopify", {"error": str(exc)}) from exc
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+
+            if response.status_code not in {429} and response.status_code < 500:
+                break
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+    if response is None:
         raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Shopify")
-    payload = res.json()
+    if response.status_code >= 400:
+        details: Any
+        try:
+            details = response.json()
+        except ValueError:
+            details = response.text[:1000]
+        raise ApiError(
+            status.HTTP_502_BAD_GATEWAY,
+            "Failed to communicate with Shopify",
+            {"statusCode": response.status_code, "response": details},
+        )
+    payload = response.json()
     if payload.get("errors"):
-        raise ApiError(status.HTTP_502_BAD_GATEWAY, payload["errors"][0].get("message", "Shopify GraphQL returned an error"))
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, payload["errors"][0].get("message", "Shopify GraphQL returned an error"), payload["errors"])
     return payload.get("data") or {}
 
 
@@ -216,6 +246,60 @@ def map_product(user_id: str, node: dict[str, Any]) -> dict[str, Any]:
 PRODUCT_QUERY = """query { products(first: 100) { nodes { id title descriptionHtml handle vendor productType status tags totalInventory featuredImage { url } media(first: 20) { nodes { image { url } preview { image { url } } } } variants(first: 50) { nodes { id title sku price compareAtPrice inventoryQuantity inventoryItem { id } } } } } }"""
 
 
+def shopify_product_input(body: ShopifyProductMutationBody, product_id: str | None = None) -> tuple[dict[str, Any], list[str]]:
+    raw = body.model_dump(exclude_none=True)
+    product_input: dict[str, Any] = {}
+    warnings: list[str] = []
+
+    for key in ("title", "vendor", "productType", "handle", "status", "tags"):
+        if raw.get(key) is not None:
+            product_input[key] = raw[key]
+
+    if raw.get("description"):
+        product_input["descriptionHtml"] = raw["description"]
+    if product_id:
+        product_input["id"] = product_id
+
+    seo = {}
+    if raw.get("seoTitle"):
+        seo["title"] = raw["seoTitle"]
+    if raw.get("seoDescription"):
+        seo["description"] = raw["seoDescription"]
+    if seo:
+        product_input["seo"] = seo
+
+    if raw.get("themeTemplate"):
+        product_input["templateSuffix"] = raw["themeTemplate"]
+
+    collection_ids = [value for value in raw.get("collections", []) if isinstance(value, str) and value.startswith("gid://shopify/Collection/")]
+    if collection_ids:
+        product_input["collectionsToJoin"] = collection_ids
+    elif raw.get("collections"):
+        warnings.append("Collections were skipped because Shopify expects collection GIDs.")
+
+    if isinstance(raw.get("category"), dict):
+        product_input["category"] = raw["category"]
+    elif raw.get("category"):
+        warnings.append("Category was skipped because Shopify expects a taxonomy category object.")
+
+    if isinstance(raw.get("metafields"), dict):
+        metafields = []
+        for key, value in raw["metafields"].items():
+            if value in {None, ""}:
+                continue
+            clean_key = re.sub(r"[^a-z0-9_]", "_", str(key).strip().lower()).strip("_")
+            if clean_key:
+                metafields.append({"namespace": "custom", "key": clean_key[:64], "type": "single_line_text_field", "value": str(value)})
+        if metafields:
+            product_input["metafields"] = metafields
+
+    skipped = [key for key in ("imagePath", "publishToOnlineStore", "compareAtPrice", "costPerItem", "chargeTax", "barcode", "weight", "weightUnit", "countryOfOrigin", "hsCode", "seoHandle", "variants") if raw.get(key) is not None]
+    if skipped:
+        warnings.append(f"Skipped fields not handled by Shopify productCreate: {', '.join(skipped)}.")
+
+    return product_input, warnings
+
+
 @shopify_router.get("/products")
 async def shopify_products(user=Depends(current_user)):
     data = await shopify_graphql(user["userId"], PRODUCT_QUERY)
@@ -243,13 +327,13 @@ async def import_products(user=Depends(current_user)):
 
 @shopify_router.post("/products", status_code=201)
 async def shopify_create_product(body: ShopifyProductMutationBody, user=Depends(current_user)):
-    product_input = {k: v for k, v in body.model_dump(exclude_none=True).items() if k not in {"variants"}}
+    product_input, warnings = shopify_product_input(body)
     data = await shopify_graphql(user["userId"], "mutation productCreate($input: ProductInput!) { productCreate(input: $input) { product { id title } userErrors { field message } } }", {"input": product_input})
     errors = data.get("productCreate", {}).get("userErrors", [])
     if errors:
         raise ApiError(status.HTTP_400_BAD_REQUEST, errors[0].get("message", "Shopify product create failed."))
     product = data.get("productCreate", {}).get("product")
-    return success("Shopify product created successfully", {"product": product, "warnings": []})
+    return success("Shopify product created successfully", {"product": product, "warnings": warnings, "imageUploaded": False, "publishedToOnlineStore": False})
 
 
 @shopify_router.patch("/products/price")
@@ -276,12 +360,12 @@ async def shopify_update_product(body: ShopifyProductMutationBody, shopifyProduc
     product_id = shopifyProductId or id
     if not product_id:
         raise ApiError(status.HTTP_400_BAD_REQUEST, "Shopify product id is required.")
-    payload = {k: v for k, v in body.model_dump(exclude_none=True).items() if k not in {"variants"}}
-    data = await shopify_graphql(user["userId"], "mutation productUpdate($input: ProductInput!) { productUpdate(input: $input) { product { id title } userErrors { field message } } }", {"input": payload | {"id": product_id}})
+    product_input, warnings = shopify_product_input(body, product_id)
+    data = await shopify_graphql(user["userId"], "mutation productUpdate($input: ProductInput!) { productUpdate(input: $input) { product { id title } userErrors { field message } } }", {"input": product_input})
     errors = data.get("productUpdate", {}).get("userErrors", [])
     if errors:
         raise ApiError(status.HTTP_400_BAD_REQUEST, errors[0].get("message", "Shopify product update failed."))
-    return success("Shopify product updated successfully", {"product": data.get("productUpdate", {}).get("product"), "warnings": []})
+    return success("Shopify product updated successfully", {"product": data.get("productUpdate", {}).get("product"), "warnings": warnings, "imageUploaded": False, "publishedToOnlineStore": False})
 
 
 @shopify_router.get("/orders")
