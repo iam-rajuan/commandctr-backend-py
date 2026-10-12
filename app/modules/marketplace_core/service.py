@@ -6,14 +6,17 @@ import hashlib
 import hmac
 import os
 import re
+import socket
 from datetime import timedelta
 from typing import Any
 from urllib.parse import quote, urlencode
+from uuid import uuid4
 
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import RedirectResponse
+from pymongo.errors import DuplicateKeyError
 from starlette import status
 
 from app.auth import current_user, make_token
@@ -33,6 +36,15 @@ shopify_router = APIRouter()
 ebay_router = APIRouter()
 etsy_router = APIRouter()
 worker_task: asyncio.Task | None = None
+worker_owner_id: str | None = None
+
+
+def runtime_worker_owner_id() -> str:
+    settings = get_settings()
+    configured = normalize(settings.EBAY_WORKER_OWNER_ID)
+    if configured:
+        return configured
+    return f"fastapi:{socket.gethostname()}:{os.getpid()}:{uuid4().hex}"
 
 
 def normalize(value: str | None) -> str | None:
@@ -1087,8 +1099,13 @@ def ebay_retryable(exc: Exception) -> bool:
 
 
 async def worker_loop() -> None:
+    owner_id = worker_owner_id or runtime_worker_owner_id()
+    lease_seconds = max(get_settings().EBAY_WORKER_LEASE_SECONDS, 5)
+    poll_seconds = max(get_settings().EBAY_WORKER_POLL_SECONDS, 0.1)
     while True:
-        await asyncio.sleep(2)
+        await asyncio.sleep(poll_seconds)
+        if not await acquire_worker_lease(owner_id, lease_seconds):
+            continue
         job = await collection("ebaysyncjobs").find_one_and_update(
             {"status": "pending", "availableAt": {"$lte": now_utc()}},
             {"$set": {"status": "processing", "startedAt": now_utc(), "updatedAt": now_utc()}, "$inc": {"attempts": 1}},
@@ -1102,7 +1119,7 @@ async def worker_loop() -> None:
             stored_result = {"data": result.get("data")} if result.get("data") is not None else {"success": result.get("success", True)}
             await collection("ebaysyncjobs").update_one({"_id": job["_id"]}, {"$set": {"status": "completed", "completedAt": now_utc(), "result": stored_result, "updatedAt": now_utc()}})
             await collection("sync_logs").insert_one({"userId": job["userId"], "marketplace": "ebay", "entityType": "product", "entityId": job.get("productId"), "action": job.get("operation"), "status": "success", "responsePayload": stored_result, "createdAt": now_utc()})
-        except (ApiError, httpx.HTTPError, RuntimeError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - workers must record unexpected job failures instead of dying.
             retryable = ebay_retryable(exc)
             should_retry = retryable and job.get("attempts", 0) < job.get("maxAttempts", 3)
             last_error = str(exc)
@@ -1122,17 +1139,47 @@ async def worker_loop() -> None:
             await collection("sync_logs").insert_one({"userId": job["userId"], "marketplace": "ebay", "entityType": "product", "entityId": job.get("productId"), "action": job.get("operation"), "status": "pending" if should_retry else "failed", "errorMessage": last_error, "responsePayload": result, "createdAt": now_utc()})
 
 
+async def acquire_worker_lease(owner_id: str, lease_seconds: int | None = None) -> bool:
+    now = now_utc()
+    lease_until = now + timedelta(seconds=lease_seconds or get_settings().EBAY_WORKER_LEASE_SECONDS)
+    try:
+        row = await collection("worker_leases").find_one_and_update(
+            {
+                "_id": "ebay-sync-worker",
+                "$or": [{"ownerId": owner_id}, {"expiresAt": {"$lte": now}}, {"expiresAt": {"$exists": False}}],
+            },
+            {
+                "$set": {
+                    "ownerId": owner_id,
+                    "heartbeatAt": now,
+                    "expiresAt": lease_until,
+                    "updatedAt": now,
+                },
+                "$setOnInsert": {"createdAt": now},
+            },
+            upsert=True,
+            return_document=True,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(row and row.get("ownerId") == owner_id)
+
+
 def start_worker() -> None:
-    global worker_task
+    global worker_owner_id, worker_task
+    if not get_settings().EBAY_WORKER_ENABLED:
+        return
     if worker_task is None:
+        worker_owner_id = runtime_worker_owner_id()
         worker_task = asyncio.create_task(worker_loop())
 
 
 def stop_worker() -> None:
-    global worker_task
+    global worker_owner_id, worker_task
     if worker_task is not None:
         worker_task.cancel()
         worker_task = None
+    worker_owner_id = None
 
 
 def etsy_config() -> dict[str, str | None]:

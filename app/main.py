@@ -17,7 +17,26 @@ from app.request_logging import print_request_log, read_payload_for_log
 settings = get_settings()
 app = FastAPI(title="CommandCtr Backend API", version="1.0.0", lifespan=lifespan)
 register_error_handlers(app)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+
+def cors_allowed_origins() -> list[str]:
+    configured = settings.CORS_ALLOWED_ORIGINS
+    if configured:
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+    if settings.FRONTEND_URL:
+        return [str(settings.FRONTEND_URL).rstrip("/")]
+    if settings.NODE_ENV == "production":
+        return []
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 rate_buckets: dict[str, deque[datetime]] = defaultdict(deque)
 
 

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     JWT_REFRESH_EXPIRES_IN: str = "7d"
     RATE_LIMIT_WINDOW_MS: int = 900000
     RATE_LIMIT_MAX: int = 100
+    CORS_ALLOWED_ORIGINS: str | None = None
     LOG_LEVEL: str = "info"
     AWS_REGION: str
     AWS_S3_BUCKET: str
@@ -51,6 +52,10 @@ class Settings(BaseSettings):
     EBAY_LISTING_FORMAT: str | None = None
     EBAY_LISTING_DURATION: str | None = None
     EBAY_DEFAULT_CONDITION: str | None = None
+    EBAY_WORKER_ENABLED: bool = False
+    EBAY_WORKER_OWNER_ID: str | None = None
+    EBAY_WORKER_LEASE_SECONDS: int = 30
+    EBAY_WORKER_POLL_SECONDS: float = 2.0
     EBAY_SANDBOX_CLIENT_ID: str | None = None
     EBAY_SANDBOX_CLIENT_SECRET: str | None = None
     EBAY_SANDBOX_RU_NAME: str | None = None
