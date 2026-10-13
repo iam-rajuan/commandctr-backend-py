@@ -26,6 +26,14 @@ Run on the project port `9000`:
 uv run python -m uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
 ```
 
+Run with nodemon-style manual restart:
+
+```powershell
+uv run python scripts/dev_server.py
+```
+
+While it is running, type `rs` and press Enter to clear the old logs and restart the FastAPI server. Type `q` and press Enter to stop it.
+
 Health check:
 
 ```text
