@@ -305,11 +305,59 @@ def shopify_product_input(body: ShopifyProductMutationBody, product_id: str | No
         if metafields:
             product_input["metafields"] = metafields
 
-    skipped = [key for key in ("imagePath", "publishToOnlineStore", "compareAtPrice", "costPerItem", "chargeTax", "barcode", "weight", "weightUnit", "countryOfOrigin", "hsCode", "seoHandle", "variants") if raw.get(key) is not None]
+    skipped = [key for key in ("publishToOnlineStore", "compareAtPrice", "costPerItem", "chargeTax", "barcode", "weight", "weightUnit", "countryOfOrigin", "hsCode", "seoHandle", "variants") if raw.get(key) is not None]
     if skipped:
         warnings.append(f"Skipped fields not handled by Shopify productCreate: {', '.join(skipped)}.")
 
     return product_input, warnings
+
+
+async def upload_shopify_product_image(user_id: str, product_id: str | None, image_path: str | None, alt_text: str | None = None) -> dict[str, Any]:
+    if not product_id or not image_path:
+        return {"uploaded": False, "warning": None}
+
+    image_url = image_path.strip()
+    if not image_url.startswith(("http://", "https://")):
+        return {"uploaded": False, "warning": "Shopify image upload requires an absolute image URL."}
+
+    try:
+        data = await shopify_graphql(
+            user_id,
+            """
+            mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
+              productCreateMedia(productId: $productId, media: $media) {
+                media {
+                  ... on MediaImage {
+                    id
+                    image { url }
+                  }
+                }
+                mediaUserErrors {
+                  field
+                  message
+                }
+              }
+            }
+            """,
+            {
+                "productId": product_id,
+                "media": [
+                    {
+                        "mediaContentType": "IMAGE",
+                        "originalSource": image_url,
+                        "alt": (alt_text or "")[:512],
+                    }
+                ],
+            },
+        )
+    except ApiError as exc:
+        return {"uploaded": False, "warning": f"Shopify image upload failed: {exc.message}"}
+
+    result = data.get("productCreateMedia", {})
+    errors = result.get("mediaUserErrors") or []
+    if errors:
+        return {"uploaded": False, "warning": errors[0].get("message", "Shopify image upload failed.")}
+    return {"uploaded": bool(result.get("media")), "warning": None}
 
 
 @shopify_router.get("/products")
@@ -345,7 +393,10 @@ async def shopify_create_product(body: ShopifyProductMutationBody, user=Depends(
     if errors:
         raise ApiError(status.HTTP_400_BAD_REQUEST, errors[0].get("message", "Shopify product create failed."))
     product = data.get("productCreate", {}).get("product")
-    return success("Shopify product created successfully", {"product": product, "warnings": warnings, "imageUploaded": False, "publishedToOnlineStore": False})
+    image_upload = await upload_shopify_product_image(user["userId"], product.get("id") if product else None, getattr(body, "imagePath", None), product_input.get("title"))
+    if image_upload["warning"]:
+        warnings.append(image_upload["warning"])
+    return success("Shopify product created successfully", {"product": product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
 
 
 @shopify_router.patch("/products/price")
@@ -377,7 +428,11 @@ async def shopify_update_product(body: ShopifyProductMutationBody, shopifyProduc
     errors = data.get("productUpdate", {}).get("userErrors", [])
     if errors:
         raise ApiError(status.HTTP_400_BAD_REQUEST, errors[0].get("message", "Shopify product update failed."))
-    return success("Shopify product updated successfully", {"product": data.get("productUpdate", {}).get("product"), "warnings": warnings, "imageUploaded": False, "publishedToOnlineStore": False})
+    product = data.get("productUpdate", {}).get("product")
+    image_upload = await upload_shopify_product_image(user["userId"], product_id, getattr(body, "imagePath", None), product_input.get("title"))
+    if image_upload["warning"]:
+        warnings.append(image_upload["warning"])
+    return success("Shopify product updated successfully", {"product": product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
 
 
 @shopify_router.get("/orders")
