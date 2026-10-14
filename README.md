@@ -1,4 +1,4 @@
-# CommandCtr FastAPI Backend
+# Twinstr FastAPI Backend
 
 FastAPI migration of the original `commandctr-backend` Express/Mongoose API.
 

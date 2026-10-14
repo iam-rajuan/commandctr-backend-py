@@ -1,1 +1,1 @@
-"""CommandCtr FastAPI backend."""
+"""Twinstr FastAPI backend."""

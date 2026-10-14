@@ -1,1 +1,1 @@
-APP_NAME = "CommandCtr Backend"
+APP_NAME = "Twinstr Backend"

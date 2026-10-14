@@ -6,14 +6,14 @@ from app.db import collection, now_utc
 
 async def ensure_default_admin() -> None:
     users = collection("users")
-    if await users.find_one({"email": "admin@commandctr.com"}):
+    if await users.find_one({"email": {"$in": ["admin@twinstr.com", "admin@commandctr.com"]}}):
         return
     now = now_utc()
     await users.insert_one(
         {
-            "firstName": "CommandCtr",
+            "firstName": "Twinstr",
             "lastName": "Admin",
-            "email": "admin@commandctr.com",
+            "email": "admin@twinstr.com",
             "password": hash_password("admin@123"),
             "role": "admin",
             "status": "active",

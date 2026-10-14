@@ -8,8 +8,8 @@ def test_health_contract():
     assert response.status_code == 200
     payload = response.json()
     assert payload["success"] is True
-    assert payload["message"] == "CommandCtr API is healthy"
-    assert payload["data"]["service"] == "CommandCtr Backend"
+    assert payload["message"] == "Twinstr API is healthy"
+    assert payload["data"]["service"] == "Twinstr Backend"
 
 
 def test_not_found_contract():

@@ -15,7 +15,7 @@ from app.errors import register_error_handlers, success
 from app.request_logging import print_request_log, read_payload_for_log
 
 settings = get_settings()
-app = FastAPI(title="CommandCtr Backend API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Twinstr Backend API", version="1.0.0", lifespan=lifespan)
 register_error_handlers(app)
 
 
@@ -54,7 +54,7 @@ async def request_middleware(request, call_next):
         bucket.popleft()
     if len(bucket) >= settings.RATE_LIMIT_MAX:
         print_request_log(
-            service="CommandCtr Backend",
+            service="Twinstr Backend",
             method=request.method,
             path=request.url.path,
             status_code=429,
@@ -75,7 +75,7 @@ async def request_middleware(request, call_next):
         response = await call_next(request)
     except Exception:
         print_request_log(
-            service="CommandCtr Backend",
+            service="Twinstr Backend",
             method=request.method,
             path=request.url.path,
             status_code="ERROR",
@@ -88,7 +88,7 @@ async def request_middleware(request, call_next):
         raise
     response.headers["x-request-id"] = request_id
     print_request_log(
-        service="CommandCtr Backend",
+        service="Twinstr Backend",
         method=request.method,
         path=request.url.path,
         status_code=response.status_code,
@@ -103,7 +103,7 @@ async def request_middleware(request, call_next):
 
 @app.get("/")
 async def root():
-    return success("CommandCtr backend is running", {"version": "1.0.0"})
+    return success("Twinstr backend is running", {"version": "1.0.0"})
 
 
 app.include_router(api_router, prefix=settings.API_PREFIX)

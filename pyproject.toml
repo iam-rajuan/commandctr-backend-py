@@ -1,7 +1,7 @@
 [project]
-name = "commandctr-backend-py"
+name = "twinstr-backend-py"
 version = "1.0.0"
-description = "FastAPI migration of the CommandCtr backend."
+description = "FastAPI backend for Twinstr."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -29,6 +29,9 @@ dev = [
 
 [tool.uv]
 package = true
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.ruff]
 line-length = 120

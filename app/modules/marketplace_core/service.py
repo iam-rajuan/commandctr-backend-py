@@ -909,7 +909,7 @@ async def ebay_connect_url(user=Depends(current_user)):
     cfg = ebay_config()
     if not cfg["clientId"] or not cfg["clientSecret"] or not cfg["ruName"]:
         raise ApiError(status.HTTP_400_BAD_REQUEST, "eBay OAuth credentials are not configured.")
-    state = make_token({"userId": user["userId"], "nonce": os.urandom(16).hex(), "marketplace": "ebay", "environment": cfg["environment"]}, get_settings().JWT_ACCESS_SECRET, "10m", iss="commandctr", aud="ebay-oauth")
+    state = make_token({"userId": user["userId"], "nonce": os.urandom(16).hex(), "marketplace": "ebay", "environment": cfg["environment"]}, get_settings().JWT_ACCESS_SECRET, "10m", iss="twinstr", aud="ebay-oauth")
     return success("eBay connect URL generated successfully", {"connectUrl": f"{cfg['authUrl']}?{urlencode({'client_id': cfg['clientId'], 'redirect_uri': cfg['ruName'], 'response_type': 'code', 'scope': ' '.join(ebay_scopes()), 'state': state})}"})
 
 
@@ -921,7 +921,10 @@ async def ebay_callback(request: Request):
     code, state = request.query_params.get("code"), request.query_params.get("state")
     if not code or not state:
         raise ApiError(status.HTTP_400_BAD_REQUEST, "Missing required eBay OAuth callback parameters.")
-    payload = jwt.decode(state, get_settings().JWT_ACCESS_SECRET, algorithms=["HS256"], issuer="commandctr", audience="ebay-oauth")
+    try:
+        payload = jwt.decode(state, get_settings().JWT_ACCESS_SECRET, algorithms=["HS256"], issuer="twinstr", audience="ebay-oauth")
+    except jwt.InvalidIssuerError:
+        payload = jwt.decode(state, get_settings().JWT_ACCESS_SECRET, algorithms=["HS256"], issuer="commandctr", audience="ebay-oauth")
     credentials = base64.b64encode(f"{cfg['clientId']}:{cfg['clientSecret']}".encode()).decode()
     async with httpx.AsyncClient(timeout=30) as client:
         res = await client.post(cfg["tokenUrl"], headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "authorization_code", "code": code, "redirect_uri": cfg["ruName"]})
