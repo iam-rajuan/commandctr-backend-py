@@ -5,6 +5,7 @@ from starlette import status
 from app.common import clean, with_timestamps
 from app.db import collection, oid, serialize
 from app.errors import ApiError
+from app.modules.marketplace_core.service import shopify_graphql
 from app.modules.products.schema import ProductCreateBody, ProductUpdateBody
 
 
@@ -61,6 +62,23 @@ async def update_product(user_id: str, product_id: str, body: ProductUpdateBody)
 
 
 async def delete_product(user_id: str, product_id: str) -> None:
-    result = await collection("products").delete_one({"_id": oid(product_id), "userId": user_id})
+    product = await collection("products").find_one({"_id": oid(product_id), "userId": user_id})
+    if not product:
+        raise ApiError(status.HTTP_404_NOT_FOUND, "Product not found")
+
+    shopify_product_id = product.get("shopifyProductId")
+    if isinstance(shopify_product_id, str) and shopify_product_id.startswith("gid://shopify/Product/"):
+        data = await shopify_graphql(
+            user_id,
+            "mutation productDelete($input: ProductDeleteInput!) { productDelete(input: $input) { deletedProductId userErrors { field message } } }",
+            {"input": {"id": shopify_product_id}},
+        )
+        errors = data.get("productDelete", {}).get("userErrors", [])
+        if errors:
+            raise ApiError(status.HTTP_400_BAD_REQUEST, errors[0].get("message", "Shopify product delete failed."))
+
+    result = await collection("products").delete_one({"_id": product["_id"], "userId": user_id})
     if result.deleted_count == 0:
         raise ApiError(status.HTTP_404_NOT_FOUND, "Product not found")
+    if isinstance(shopify_product_id, str):
+        await collection("inventories").delete_many({"userId": user_id, "shopifyProductId": shopify_product_id})

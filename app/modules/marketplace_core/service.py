@@ -255,7 +255,10 @@ def map_product(user_id: str, node: dict[str, Any]) -> dict[str, Any]:
     return {"userId": user_id, "marketplace": "shopify", "shopifyProductId": node.get("id"), "title": node.get("title"), "description": node.get("descriptionHtml", ""), "handle": node.get("handle"), "vendor": node.get("vendor", ""), "productType": node.get("productType", ""), "status": node.get("status", ""), "tags": node.get("tags") or [], "totalInventory": node.get("totalInventory") or 0, "featuredImage": image, "images": [i for i in images if i], "variants": [{"shopifyVariantId": v.get("id"), "title": v.get("title"), "sku": v.get("sku", ""), "price": v.get("price", ""), "compareAtPrice": v.get("compareAtPrice", ""), "inventoryQuantity": v.get("inventoryQuantity") or 0, "inventoryItemId": (v.get("inventoryItem") or {}).get("id", "")} for v in variants], "rawShopifyData": node, "lastSyncedAt": now_utc()}
 
 
-PRODUCT_QUERY = """query { products(first: 100) { nodes { id title descriptionHtml handle vendor productType status tags totalInventory featuredImage { url } media(first: 20) { nodes { image { url } preview { image { url } } } } variants(first: 50) { nodes { id title sku price compareAtPrice inventoryQuantity inventoryItem { id } } } } } }"""
+PRODUCT_FIELDS = """id title descriptionHtml handle vendor productType status tags totalInventory featuredImage { url } media(first: 20) { nodes { preview { image { url } } ... on MediaImage { image { url } } } } variants(first: 50) { nodes { id title sku price compareAtPrice inventoryQuantity inventoryItem { id } } }"""
+PRODUCT_QUERY = f"""query {{ products(first: 100) {{ nodes {{ {PRODUCT_FIELDS} }} }} }}"""
+PRODUCT_BY_ID_QUERY = f"""query ProductById($id: ID!) {{ product(id: $id) {{ {PRODUCT_FIELDS} }} }}"""
+PRODUCT_VARIANTS_QUERY = """query ProductVariants($id: ID!) { product(id: $id) { variants(first: 50) { nodes { id title inventoryItem { id } } } } }"""
 
 
 def shopify_product_input(body: ShopifyProductMutationBody, product_id: str | None = None) -> tuple[dict[str, Any], list[str]]:
@@ -360,6 +363,125 @@ async def upload_shopify_product_image(user_id: str, product_id: str | None, ima
     return {"uploaded": bool(result.get("media")), "warning": None}
 
 
+async def first_active_shopify_location_id(user_id: str) -> str | None:
+    data = await shopify_graphql(user_id, "query { locations(first: 1, query: \"active:true\") { nodes { id } } }")
+    nodes = data.get("locations", {}).get("nodes", [])
+    return nodes[0].get("id") if nodes else None
+
+
+async def apply_shopify_variant_payloads(user_id: str, product_id: str | None, variants_payload: list[dict[str, Any]] | None) -> list[str]:
+    if not product_id or not variants_payload:
+        return []
+
+    warnings: list[str] = []
+    data = await shopify_graphql(user_id, PRODUCT_VARIANTS_QUERY, {"id": product_id})
+    variant_nodes = ((data.get("product") or {}).get("variants") or {}).get("nodes") or []
+    if not variant_nodes:
+        return ["Shopify variant details were skipped because no variants were returned."]
+
+    updates = []
+    inventory_quantities = []
+    location_id: str | None = None
+    for index, payload in enumerate(variants_payload):
+        if index >= len(variant_nodes):
+            break
+        node = variant_nodes[index]
+        update: dict[str, Any] = {"id": node["id"]}
+        if payload.get("price") not in {None, ""}:
+            update["price"] = str(payload["price"])
+        if payload.get("compareAtPrice") not in {None, ""}:
+            update["compareAtPrice"] = str(payload["compareAtPrice"])
+
+        inventory_item: dict[str, Any] = {}
+        if payload.get("sku"):
+            inventory_item["sku"] = str(payload["sku"])
+        if payload.get("trackInventory") is not None:
+            inventory_item["tracked"] = bool(payload["trackInventory"])
+        if inventory_item:
+            update["inventoryItem"] = inventory_item
+        updates.append(update)
+
+        inventory_item_id = (node.get("inventoryItem") or {}).get("id")
+        if inventory_item_id and bool(payload.get("trackInventory")):
+            if location_id is None:
+                location_id = await first_active_shopify_location_id(user_id)
+            if location_id:
+                inventory_quantities.append(
+                    {
+                        "inventoryItemId": inventory_item_id,
+                        "locationId": location_id,
+                        "quantity": max(int(payload.get("inventoryQuantity") or 0), 0),
+                        "changeFromQuantity": None,
+                    }
+                )
+
+    if updates:
+        result = await shopify_graphql(
+            user_id,
+            "mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) { productVariantsBulkUpdate(productId: $productId, variants: $variants) { productVariants { id } userErrors { field message } } }",
+            {"productId": product_id, "variants": updates},
+        )
+        errors = (result.get("productVariantsBulkUpdate") or {}).get("userErrors") or []
+        if errors:
+            warnings.append(errors[0].get("message", "Shopify variant update failed."))
+
+    if inventory_quantities:
+        result = await shopify_graphql(
+            user_id,
+            "mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) { inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) { inventoryAdjustmentGroup { createdAt } userErrors { field message } } }",
+            {"input": {"name": "available", "reason": "correction", "quantities": inventory_quantities}, "idempotencyKey": str(uuid4())},
+        )
+        errors = (result.get("inventorySetQuantities") or {}).get("userErrors") or []
+        if errors:
+            warnings.append(errors[0].get("message", "Shopify inventory quantity update failed."))
+    elif any(bool(payload.get("trackInventory")) for payload in variants_payload):
+        warnings.append("Shopify inventory quantity was skipped because no active Shopify location was returned.")
+
+    return warnings
+
+
+async def upsert_shopify_product_snapshot(user_id: str, product_id: str | None) -> dict[str, Any] | None:
+    if not product_id:
+        return None
+
+    data = await shopify_graphql(user_id, PRODUCT_BY_ID_QUERY, {"id": product_id})
+    node = data.get("product")
+    if not node:
+        return None
+
+    mapped = map_product(user_id, node)
+    await collection("products").update_one(
+        {"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]},
+        {"$set": mapped | {"updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}},
+        upsert=True,
+    )
+    for variant in mapped["variants"]:
+        if variant.get("inventoryItemId"):
+            await collection("inventories").update_one(
+                {"userId": user_id, "inventoryItemId": variant["inventoryItemId"], "locationId": ""},
+                {
+                    "$set": {
+                        "userId": user_id,
+                        "marketplace": "shopify",
+                        "shopifyProductId": mapped["shopifyProductId"],
+                        "shopifyVariantId": variant.get("shopifyVariantId"),
+                        "inventoryItemId": variant["inventoryItemId"],
+                        "sku": variant.get("sku"),
+                        "title": f"{mapped['title']} - {variant.get('title')}",
+                        "shopifyQuantity": variant.get("inventoryQuantity", 0),
+                        "availableQuantity": variant.get("inventoryQuantity", 0),
+                        "isActive": True,
+                        "sourceStatus": "active",
+                        "lastSyncedAt": now_utc(),
+                        "updatedAt": now_utc(),
+                    },
+                    "$setOnInsert": {"createdAt": now_utc()},
+                },
+                upsert=True,
+            )
+    return mapped
+
+
 @shopify_router.get("/products")
 async def shopify_products(user=Depends(current_user)):
     data = await shopify_graphql(user["userId"], PRODUCT_QUERY)
@@ -368,21 +490,30 @@ async def shopify_products(user=Depends(current_user)):
 
 @shopify_router.post("/import-products")
 async def import_products(user=Depends(current_user)):
-    data = await shopify_graphql(user["userId"], PRODUCT_QUERY)
+    return success("Shopify products imported successfully", await sync_shopify_products_for_user(user["userId"]))
+
+
+@shopify_router.post("/sync-products")
+async def sync_products(user=Depends(current_user)):
+    return success("Shopify products synced successfully", await sync_shopify_products_for_user(user["userId"]))
+
+
+async def sync_shopify_products_for_user(user_id: str) -> dict[str, int]:
+    data = await shopify_graphql(user_id, PRODUCT_QUERY)
     nodes = data.get("products", {}).get("nodes", [])
     imported = updated = 0
     live_keys = []
     for node in nodes:
-        mapped = map_product(user["userId"], node)
+        mapped = map_product(user_id, node)
         live_keys.extend([v.get("inventoryItemId") + "::" for v in mapped["variants"] if v.get("inventoryItemId")])
-        result = await collection("products").update_one({"userId": user["userId"], "shopifyProductId": mapped["shopifyProductId"]}, {"$set": mapped | {"updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
+        result = await collection("products").update_one({"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]}, {"$set": mapped | {"updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
         imported += int(bool(result.upserted_id))
         updated += int(not result.upserted_id)
         for variant in mapped["variants"]:
             if variant.get("inventoryItemId"):
-                await collection("inventories").update_one({"userId": user["userId"], "inventoryItemId": variant["inventoryItemId"], "locationId": ""}, {"$set": {"userId": user["userId"], "marketplace": "shopify", "shopifyProductId": mapped["shopifyProductId"], "shopifyVariantId": variant.get("shopifyVariantId"), "inventoryItemId": variant["inventoryItemId"], "sku": variant.get("sku"), "title": f"{mapped['title']} - {variant.get('title')}", "shopifyQuantity": variant.get("inventoryQuantity", 0), "availableQuantity": variant.get("inventoryQuantity", 0), "isActive": True, "sourceStatus": "active", "lastSyncedAt": now_utc(), "updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
-    await collection("marketplaceconnections").update_one({"userId": user["userId"], "marketplace": "shopify"}, {"$set": {"lastSyncedAt": now_utc(), "status": "connected", "updatedAt": now_utc()}})
-    return success("Shopify products imported successfully", {"count": len(nodes), "importedCount": imported, "updatedCount": updated, "staleMarkedInactiveCount": 0, "activeCount": len(nodes)})
+                await collection("inventories").update_one({"userId": user_id, "inventoryItemId": variant["inventoryItemId"], "locationId": ""}, {"$set": {"userId": user_id, "marketplace": "shopify", "shopifyProductId": mapped["shopifyProductId"], "shopifyVariantId": variant.get("shopifyVariantId"), "inventoryItemId": variant["inventoryItemId"], "sku": variant.get("sku"), "title": f"{mapped['title']} - {variant.get('title')}", "shopifyQuantity": variant.get("inventoryQuantity", 0), "availableQuantity": variant.get("inventoryQuantity", 0), "isActive": True, "sourceStatus": "active", "lastSyncedAt": now_utc(), "updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
+    await collection("marketplaceconnections").update_one({"userId": user_id, "marketplace": "shopify"}, {"$set": {"lastSyncedAt": now_utc(), "status": "connected", "updatedAt": now_utc()}})
+    return {"count": len(nodes), "importedCount": imported, "updatedCount": updated, "staleMarkedInactiveCount": 0, "activeCount": len(nodes)}
 
 
 @shopify_router.post("/products", status_code=201)
@@ -396,7 +527,9 @@ async def shopify_create_product(body: ShopifyProductMutationBody, user=Depends(
     image_upload = await upload_shopify_product_image(user["userId"], product.get("id") if product else None, getattr(body, "imagePath", None), product_input.get("title"))
     if image_upload["warning"]:
         warnings.append(image_upload["warning"])
-    return success("Shopify product created successfully", {"product": product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
+    warnings.extend(await apply_shopify_variant_payloads(user["userId"], product.get("id") if product else None, getattr(body, "variants", None)))
+    synced_product = await upsert_shopify_product_snapshot(user["userId"], product.get("id") if product else None)
+    return success("Shopify product created successfully", {"product": synced_product or product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
 
 
 @shopify_router.patch("/products/price")
@@ -432,7 +565,9 @@ async def shopify_update_product(body: ShopifyProductMutationBody, shopifyProduc
     image_upload = await upload_shopify_product_image(user["userId"], product_id, getattr(body, "imagePath", None), product_input.get("title"))
     if image_upload["warning"]:
         warnings.append(image_upload["warning"])
-    return success("Shopify product updated successfully", {"product": product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
+    warnings.extend(await apply_shopify_variant_payloads(user["userId"], product_id, getattr(body, "variants", None)))
+    synced_product = await upsert_shopify_product_snapshot(user["userId"], product_id)
+    return success("Shopify product updated successfully", {"product": synced_product or product, "warnings": warnings, "imageUploaded": image_upload["uploaded"], "publishedToOnlineStore": False})
 
 
 @shopify_router.get("/orders")
@@ -602,7 +737,7 @@ async def shopify_update_inventory(body: ShopifyInventoryBody, inventoryItemId: 
     item_id = inventoryItemId or id
     if not item_id:
         raise ApiError(status.HTTP_400_BAD_REQUEST, "Shopify inventory item id is required.")
-    data = await shopify_graphql(user["userId"], "mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) { inventorySetQuantities(input: $input) { inventoryAdjustmentGroup { createdAt } userErrors { field message } } }", {"input": {"name": "available", "reason": "correction", "quantities": [{"inventoryItemId": item_id, "locationId": body.locationId, "quantity": body.quantity}]}})
+    data = await shopify_graphql(user["userId"], "mutation inventorySetQuantities($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) { inventorySetQuantities(input: $input) @idempotent(key: $idempotencyKey) { inventoryAdjustmentGroup { createdAt } userErrors { field message } } }", {"input": {"name": "available", "reason": "correction", "quantities": [{"inventoryItemId": item_id, "locationId": body.locationId, "quantity": body.quantity, "changeFromQuantity": None}]}, "idempotencyKey": str(uuid4())})
     await collection("inventories").update_one({"userId": user["userId"], "inventoryItemId": item_id, "locationId": body.locationId}, {"$set": {"shopifyQuantity": body.quantity, "availableQuantity": body.quantity, "lastSyncedAt": now_utc(), "updatedAt": now_utc()}}, upsert=False)
     return success("Shopify inventory updated successfully", data.get("inventorySetQuantities"))
 
