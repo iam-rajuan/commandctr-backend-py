@@ -64,12 +64,31 @@ def marketplace_connection_unique_index_specs() -> list[dict[str, Any]]:
                 "name": "uniq_marketplace_environment_connection",
                 "unique": True,
                 "partialFilterExpression": {
-                    "marketplace": {"$in": ["ebay", "etsy"]},
+                    "marketplace": {"$in": ["amazon", "ebay", "etsy"]},
                     "environment": {"$exists": True, "$type": "string"},
                 },
             },
         },
     ]
+
+
+async def drop_unsafe_legacy_marketplace_connection_indexes() -> list[str]:
+    """Remove only the known pre-partial Shopify index that blocks other marketplaces."""
+    expected_keys = [("userId", 1), ("marketplace", 1), ("shopDomain", 1)]
+    dropped: list[str] = []
+    indexes = await collection("marketplaceconnections").list_indexes().to_list(length=None)
+    for index in indexes:
+        name = index.get("name")
+        keys = list((index.get("key") or {}).items())
+        if (
+            name == "userId_1_marketplace_1_shopDomain_1"
+            and keys == expected_keys
+            and index.get("unique") is True
+            and not index.get("partialFilterExpression")
+        ):
+            await collection("marketplaceconnections").drop_index(name)
+            dropped.append(name)
+    return dropped
 
 
 async def find_marketplace_connection_duplicates() -> list[dict[str, Any]]:
@@ -79,7 +98,7 @@ async def find_marketplace_connection_duplicates() -> list[dict[str, Any]]:
                 "$or": [
                     {"marketplace": "shopify", "shopDomain": {"$exists": True, "$type": "string"}},
                     {
-                        "marketplace": {"$in": ["ebay", "etsy"]},
+                        "marketplace": {"$in": ["amazon", "ebay", "etsy"]},
                         "environment": {"$exists": True, "$type": "string"},
                     },
                 ]
@@ -172,6 +191,7 @@ async def create_indexes() -> None:
         unique=True,
     )
     await safe_create_index("marketplaceconnections", [("userId", ASCENDING)])
+    await drop_unsafe_legacy_marketplace_connection_indexes()
     await assert_marketplace_connection_indexes_safe()
     for spec in marketplace_connection_unique_index_specs():
         await safe_create_index("marketplaceconnections", spec["keys"], **spec["kwargs"])

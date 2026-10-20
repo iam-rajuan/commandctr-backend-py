@@ -24,6 +24,27 @@ class FakeLeaseCollection:
         return {"_id": "ebay-sync-worker", "ownerId": self.existing_owner}
 
 
+class FakeIndexCursor:
+    def __init__(self, indexes):
+        self.indexes = indexes
+
+    async def to_list(self, *, length):
+        assert length is None
+        return self.indexes
+
+
+class FakeIndexCollection:
+    def __init__(self, indexes):
+        self.indexes = indexes
+        self.dropped = []
+
+    def list_indexes(self):
+        return FakeIndexCursor(self.indexes)
+
+    async def drop_index(self, name):
+        self.dropped.append(name)
+
+
 def test_marketplace_connection_unique_indexes_match_node_reference():
     specs = db.marketplace_connection_unique_index_specs()
 
@@ -37,9 +58,35 @@ def test_marketplace_connection_unique_indexes_match_node_reference():
     assert specs[1]["keys"] == [("userId", 1), ("marketplace", 1), ("environment", 1)]
     assert specs[1]["kwargs"]["unique"] is True
     assert specs[1]["kwargs"]["partialFilterExpression"] == {
-        "marketplace": {"$in": ["ebay", "etsy"]},
+        "marketplace": {"$in": ["amazon", "ebay", "etsy"]},
         "environment": {"$exists": True, "$type": "string"},
     }
+
+
+@pytest.mark.asyncio
+async def test_drops_only_known_unsafe_legacy_marketplace_index(monkeypatch):
+    legacy_name = "userId_1_marketplace_1_shopDomain_1"
+    fake = FakeIndexCollection(
+        [
+            {
+                "name": legacy_name,
+                "key": {"userId": 1, "marketplace": 1, "shopDomain": 1},
+                "unique": True,
+            },
+            {
+                "name": "uniq_shopify_shop_domain_connection",
+                "key": {"userId": 1, "marketplace": 1, "shopDomain": 1},
+                "unique": True,
+                "partialFilterExpression": {"marketplace": "shopify"},
+            },
+        ]
+    )
+    monkeypatch.setattr(db, "collection", lambda _name: fake)
+
+    dropped = await db.drop_unsafe_legacy_marketplace_connection_indexes()
+
+    assert dropped == [legacy_name]
+    assert fake.dropped == [legacy_name]
 
 
 def test_cors_uses_explicit_origins_when_configured(monkeypatch):

@@ -66,6 +66,12 @@ async def delete_product(user_id: str, product_id: str) -> None:
     if not product:
         raise ApiError(status.HTTP_404_NOT_FOUND, "Product not found")
 
+    if product.get("marketplace") == "amazon":
+        from app.modules.amazon.service import delete_listing
+
+        await delete_listing(user_id, product_id)
+        return
+
     shopify_product_id = product.get("shopifyProductId")
     if isinstance(shopify_product_id, str) and shopify_product_id.startswith("gid://shopify/Product/"):
         data = await shopify_graphql(

@@ -75,6 +75,18 @@ class Settings(BaseSettings):
     ETSY_TOKEN_URL: AnyUrl | None = None
     ETSY_API_BASE_URL: AnyUrl | None = None
     ETSY_SHARED_SECRET: str | None = None
+    AMAZON_SP_API_ENVIRONMENT: Literal["sandbox", "production"] | None = None
+    AMAZON_SP_API_REGION: str | None = None
+    AMAZON_SP_API_ENDPOINT: AnyUrl | None = None
+    AMAZON_MARKETPLACE_ID: str | None = None
+    AMAZON_CURRENCY: str | None = None
+    AMAZON_DEFAULT_CONDITION: str | None = None
+    AMAZON_SELLER_ID: str | None = None
+    AMAZON_LWA_CLIENT_ID: str | None = None
+    AMAZON_LWA_CLIENT_SECRET: str | None = None
+    AMAZON_LWA_REFRESH_TOKEN: str | None = None
+    AMAZON_APP_ID: str | None = None
+    AMAZON_REDIRECT_URI: AnyUrl | None = None
     FRONTEND_URL: AnyUrl | None = None
     ENCRYPTION_SECRET: str = Field(min_length=32)
 

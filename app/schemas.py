@@ -63,7 +63,7 @@ class ProductVariantBody(BaseModel):
 
 
 class ProductCreateBody(BaseModel):
-    marketplace: Literal["shopify", "ebay", "etsy"] | None = None
+    marketplace: Literal["shopify", "ebay", "etsy", "amazon"] | None = None
     shopifyProductId: str | None = None
     productAiProductId: str | None = None
     title: str = Field(min_length=1)

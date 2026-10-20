@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.modules.admin.route import router as admin_router
+from app.modules.amazon.route import router as amazon_router
 from app.modules.auth.route import router as auth_router
 from app.modules.dashboard.route import router as dashboard_router
 from app.modules.disputes.route import router as dispute_router
@@ -21,6 +22,7 @@ api_router.include_router(health_router, prefix="/health")
 api_router.include_router(auth_router, prefix="/auth")
 api_router.include_router(user_router, prefix="/users")
 api_router.include_router(admin_router, prefix="/admin")
+api_router.include_router(amazon_router, prefix="/amazon")
 api_router.include_router(dashboard_router, prefix="/dashboard")
 api_router.include_router(dispute_router, prefix="/disputes")
 api_router.include_router(ebay_router, prefix="/ebay")
