@@ -15,6 +15,15 @@ class AmazonListingBody(BaseModel):
     bulletPoints: list[str] = Field(default_factory=list)
     backendSearchTerms: list[str] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
+    # `gtin` is the normal catalogue path.  Amazon does not provide a general
+    # API to approve GTIN exemptions, so `no_identifier` is deliberately a
+    # seller-attested/manual workflow and is validated before a write occurs.
+    identifierMode: str = Field(default="gtin", pattern="^(gtin|asin|no_identifier)$")
+    existingAsin: str | None = Field(default=None, min_length=10, max_length=10)
+    exemptionConfirmed: bool = False
+    exemptionBrand: str | None = None
+    exemptionCategory: str | None = None
+    confirmProductionSubmission: bool = False
 
     @field_validator("price")
     @classmethod

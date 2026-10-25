@@ -87,6 +87,23 @@ def test_json_attribute_value_supports_amazon_unit_objects(monkeypatch):
     assert payload["attributes"]["capacity"] == [{"value": 750, "unit": "milliliters"}]
 
 
+def test_barcode_free_generic_payload_omits_identifier(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = listing_body().model_copy(update={
+        "brand": "Generic", "identifierMode": "no_identifier", "exemptionConfirmed": True,
+        "exemptionBrand": "Generic", "exemptionCategory": "BOTTLE",
+        "attributes": {"supplier_declared_dg_hz_regulation": "not_applicable"},
+    })
+    payload = service.listing_submission(body, service.amazon_config())
+    assert "externally_assigned_product_identifier" not in payload["attributes"]
+
+
+def test_barcode_free_requires_confirmed_exemption():
+    body = listing_body().model_copy(update={"identifierMode": "no_identifier", "attributes": {}})
+    with pytest.raises(ApiError):
+        service.validate_identifier_path(body)
+
+
 @pytest.mark.asyncio
 async def test_canonical_product_type_does_not_call_amazon(monkeypatch):
     body = listing_body().model_copy(update={"productType": "BOTTLE"})

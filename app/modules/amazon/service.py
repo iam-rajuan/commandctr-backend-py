@@ -88,6 +88,8 @@ def listing_attributes(body: AmazonListingBody, config: dict[str, str]) -> dict[
             {"media_location": body.imagePath, "marketplace_id": marketplace_id}
         ]
     for key, value in body.attributes.items():
+        if body.identifierMode == "no_identifier" and key in {"externally_assigned_product_identifier", "merchant_suggested_asin"}:
+            continue
         if key in {"category", "product_type"}:
             continue
         if isinstance(value, str) and value.strip().startswith(("[", "{")):
@@ -103,6 +105,38 @@ def listing_attributes(body: AmazonListingBody, config: dict[str, str]) -> dict[
         else:
             attributes[key] = value
     return attributes
+
+
+def validate_identifier_path(body: AmazonListingBody) -> None:
+    identifier = body.attributes.get("externally_assigned_product_identifier")
+    if body.identifierMode == "gtin" and not identifier:
+        raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "A valid EAN, UPC, or GTIN is required for this identifier option.")
+    if body.identifierMode == "asin" and not body.existingAsin:
+        raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Enter the existing Amazon ASIN for this identifier option.")
+    if body.identifierMode == "no_identifier":
+        if identifier or body.existingAsin:
+            raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Barcode-free products must not include a GTIN or ASIN.")
+        if not body.exemptionConfirmed or not body.exemptionBrand or not body.exemptionCategory:
+            raise ApiError(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "GTIN exemption confirmation is required for the selected brand and product category.",
+                {"requiresSellerCentralApproval": True},
+            )
+
+
+async def product_type_definition(user_id: str, product_type: str) -> dict[str, Any]:
+    """Read the current UK schema only; it never creates or changes listings."""
+    config = amazon_config()
+    token = await connected_access_token(user_id, config)
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{config['endpoint']}/definitions/2020-09-01/productTypes/{quote(product_type, safe='')}",
+            params={"marketplaceIds": config["marketplaceId"], "requirements": "LISTING", "locale": "en_GB"},
+            headers={"x-amz-access-token": token, "user-agent": "CommandCtr/0.1 (Language=Python)"},
+        )
+    if response.status_code >= 400:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Amazon could not load the Product Type Definition.", {"statusCode": response.status_code})
+    return response.json()
 
 
 async def connected_access_token(user_id: str, config: dict[str, str]) -> str:
@@ -207,6 +241,7 @@ def listing_submission(body: AmazonListingBody, config: dict[str, str]) -> dict[
 
 
 async def validate_listing(user_id: str, body: AmazonListingBody) -> dict[str, Any]:
+    validate_identifier_path(body)
     config = amazon_config()
     if config["environment"] != "production":
         return {"status": "ACCEPTED", "issues": []}
@@ -270,6 +305,12 @@ async def create_listing(user_id: str, body: AmazonListingBody) -> dict[str, Any
     if existing:
         return await update_listing(user_id, str(existing["_id"]), AmazonListingUpdateBody(**body.model_dump()))
     await validate_listing(user_id, body)
+    if config["environment"] == "production" and not body.confirmProductionSubmission:
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "Validation passed. Confirm the production submission before CommandCtr sends this listing to Amazon.",
+            {"validationPassed": True, "requiresConfirmation": True},
+        )
     response = await listings_request(
         user_id,
         "PUT",

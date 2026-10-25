@@ -25,6 +25,12 @@ async def verify_amazon(user=Depends(current_user)):
     return success("Amazon connection verified successfully", result)
 
 
+@router.get("/product-types/{product_type}/definition")
+async def amazon_product_type_definition(product_type: str, user=Depends(current_user)):
+    definition = await service.product_type_definition(user["userId"], product_type)
+    return success("Amazon Product Type Definition fetched successfully", definition)
+
+
 @router.post("/disconnect")
 async def disconnect_amazon(user=Depends(current_user)):
     connection = await service.disconnect(user["userId"])
