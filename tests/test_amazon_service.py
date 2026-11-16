@@ -164,3 +164,261 @@ async def test_production_validation_preview_rejects_errors(monkeypatch):
 
     with pytest.raises(ApiError):
         await service.validate_listing("user-1", listing_body())
+
+
+def test_offer_only_listing_submission_uses_existing_asin_and_offer_requirements(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = AmazonListingBody(
+        title="NOTEBOOK BASIC: NOTEBOOK, NOTEBOOK 8.5 X 11",
+        sku="SKU-NOTEBOOK-001",
+        price="8.99",
+        quantity=15,
+        productType="ABIS_BOOK",
+        identifierMode="asin",
+        existingAsin="B09TDW5M2C",
+        condition="new_new",
+        fulfillmentChannel="DEFAULT",
+    )
+
+    payload = service.listing_submission(body, service.amazon_config())
+
+    assert payload["productType"] == "ABIS_BOOK"
+    assert payload["requirements"] == "LISTING_OFFER_ONLY"
+    assert payload["attributes"]["merchant_suggested_asin"][0]["value"] == "B09TDW5M2C"
+    assert payload["attributes"]["merchant_suggested_asin"][0]["marketplace_id"] == "A1F83G8C2ARO7P"
+    assert payload["attributes"]["condition_type"][0]["value"] == "new_new"
+    assert payload["attributes"]["purchasable_offer"][0]["currency"] == "GBP"
+    assert payload["attributes"]["purchasable_offer"][0]["our_price"][0]["schedule"][0]["value_with_tax"] == 8.99
+    assert payload["attributes"]["fulfillment_availability"][0]["quantity"] == 15
+    assert payload["attributes"]["fulfillment_availability"][0]["fulfillment_channel_code"] == "DEFAULT"
+    # Ensure catalogue fields are NOT included in offer-only attributes
+    assert "item_name" not in payload["attributes"]
+    assert "product_description" not in payload["attributes"]
+    assert "brand" not in payload["attributes"]
+    assert "bullet_point" not in payload["attributes"]
+    assert "externally_assigned_product_identifier" not in payload["attributes"]
+
+
+def test_offer_only_validation_requires_valid_10_char_asin():
+    body_short = AmazonListingBody.model_construct(
+        title="Test", sku="SKU-1", price="10.00", quantity=1,
+        identifierMode="asin", existingAsin="B09TDW"
+    )
+    with pytest.raises(ApiError) as exc_short:
+        service.validate_identifier_path(body_short)
+    assert exc_short.value.status_code == 422
+
+    body_empty = AmazonListingBody.model_construct(
+        title="Test", sku="SKU-1", price="10.00", quantity=1,
+        identifierMode="asin", existingAsin=None
+    )
+    with pytest.raises(ApiError) as exc_empty:
+        service.validate_identifier_path(body_empty)
+    assert exc_empty.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_catalog_item_lookup_parses_summaries_and_images(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+
+    async def fake_token(*_args, **_kwargs):
+        return "fake-token"
+
+    class FakeCatalogResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "summaries": [
+                    {
+                        "itemName": "NOTEBOOK BASIC: NOTEBOOK, NOTEBOOK 8.5 X 11",
+                        "brand": "Notebooks Co",
+                        "manufacturer": "Independently published",
+                        "itemClassification": "BASE_PRODUCT",
+                    }
+                ],
+                "productTypes": [{"productType": "ABIS_BOOK"}],
+                "images": [
+                    {
+                        "images": [
+                            {"variant": "MAIN", "link": "https://m.media-amazon.com/images/I/example.jpg", "height": 500, "width": 500}
+                        ]
+                    }
+                ],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *_args, **_kwargs):
+            assert "catalog/2022-04-01/items/B09TDW5M2C" in url
+            return FakeCatalogResponse()
+
+    monkeypatch.setattr(service, "connected_access_token", fake_token)
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+
+    result = await service.catalog_item_lookup("user-1", "B09TDW5M2C")
+
+    assert result["asin"] == "B09TDW5M2C"
+    assert result["title"] == "NOTEBOOK BASIC: NOTEBOOK, NOTEBOOK 8.5 X 11"
+    assert result["productType"] == "ABIS_BOOK"
+    assert result["imageUrl"] == "https://m.media-amazon.com/images/I/example.jpg"
+    assert result["marketplaceId"] == "A1F83G8C2ARO7P"
+
+
+@pytest.mark.asyncio
+async def test_check_restrictions_parses_eligibility(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+
+    async def fake_token(*_args, **_kwargs):
+        return "fake-token"
+
+    class FakeRestrictionsResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"restrictions": []}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *_args, **_kwargs):
+            assert "listings/2021-08-01/restrictions" in url
+            return FakeRestrictionsResponse()
+
+    monkeypatch.setattr(service, "connected_access_token", fake_token)
+    monkeypatch.setattr(service.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+
+    result = await service.check_restrictions("user-1", "B09TDW5M2C", "new_new")
+
+    assert result["asin"] == "B09TDW5M2C"
+    assert result["restricted"] is False
+    assert result["eligible"] is True
+    assert result["restrictions"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_listing_preview_returns_structured_result(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = AmazonListingBody(
+        title="NOTEBOOK BASIC",
+        sku="SKU-NOTEBOOK-001",
+        price="8.99",
+        quantity=5,
+        productType="ABIS_BOOK",
+        identifierMode="asin",
+        existingAsin="B09TDW5M2C",
+    )
+
+    async def fake_request(*_args, **kwargs):
+        assert kwargs.get("validation_preview") is True
+        return {"status": "ACCEPTED", "issues": []}
+
+    monkeypatch.setattr(service, "listings_request", fake_request)
+
+    res = await service.validate_listing_preview("user-1", body)
+
+    assert res["valid"] is True
+    assert res["status"] == "ACCEPTED"
+    assert res["issues"] == []
+    assert res["sku"] == "SKU-NOTEBOOK-001"
+    assert res["productType"] == "ABIS_BOOK"
+
+
+def test_local_listing_document_stores_amazon_asin_and_condition(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = AmazonListingBody(
+        title="NOTEBOOK BASIC",
+        sku="SKU-NOTEBOOK-001",
+        price="8.99",
+        quantity=5,
+        productType="ABIS_BOOK",
+        identifierMode="asin",
+        existingAsin="B09TDW5M2C",
+        condition="new_new",
+        fulfillmentChannel="DEFAULT",
+    )
+
+    doc = service.local_listing_document(body, {"submissionId": "sub-123", "status": "ACCEPTED"}, service.amazon_config())
+
+    assert doc["marketplace"] == "amazon"
+    assert doc["amazonSku"] == "SKU-NOTEBOOK-001"
+    assert doc["amazonAsin"] == "B09TDW5M2C"
+    assert doc["amazonCondition"] == "new_new"
+    assert doc["amazonFulfillmentChannel"] == "DEFAULT"
+    assert doc["amazonListingUrl"] == "https://www.amazon.co.uk/dp/B09TDW5M2C"
+    assert doc["amazonSubmissionId"] == "sub-123"
+    assert doc["amazonPayload"]["identifierMode"] == "asin"
+    assert doc["amazonPayload"]["existingAsin"] == "B09TDW5M2C"
+
+
+@pytest.mark.asyncio
+async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
+    from bson import ObjectId
+
+    from app.modules.amazon.schema import AmazonOfferPatchBody
+
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+
+    fake_id = ObjectId()
+    fake_product = {
+        "_id": fake_id,
+        "userId": "user-1",
+        "marketplace": "amazon",
+        "environment": "production",
+        "amazonSku": "SKU-NOTEBOOK-001",
+        "productType": "ABIS_BOOK",
+        "amazonFulfillmentChannel": "DEFAULT",
+        "price": "8.99",
+        "totalInventory": 5,
+        "variants": [{"title": "Default Title", "sku": "SKU-NOTEBOOK-001", "price": "8.99", "inventoryQuantity": 5}],
+    }
+
+    recorded_patches = []
+
+    async def fake_listings_request(_user_id, method, sku, body=None, **_kwargs):
+        assert method == "PATCH"
+        assert sku == "SKU-NOTEBOOK-001"
+        assert body["productType"] == "ABIS_BOOK"
+        recorded_patches.extend(body["patches"])
+        return {"status": "ACCEPTED", "issues": []}
+
+    class FakeCollection:
+        async def find_one(self, *args, **kwargs):
+            return fake_product
+
+        async def find_one_and_update(self, query, update, **kwargs):
+            doc = fake_product.copy()
+            for k, v in update["$set"].items():
+                if k == "price":
+                    doc["price"] = v
+                elif k == "totalInventory":
+                    doc["totalInventory"] = v
+            return doc
+
+    monkeypatch.setattr(service, "listings_request", fake_listings_request)
+    monkeypatch.setattr(service, "collection", lambda name: FakeCollection())
+
+    body = AmazonOfferPatchBody(price="10.50", quantity=25)
+    res = await service.patch_listing_offer("user-1", str(fake_id), body)
+
+    assert len(recorded_patches) == 3
+    # Check purchasable_offer patch
+    offer_patch = next(p for p in recorded_patches if p["path"] == "/attributes/purchasable_offer")
+    assert offer_patch["value"][0]["our_price"][0]["schedule"][0]["value_with_tax"] == 10.50
+    # Check fulfillment_availability patch
+    inv_patch = next(p for p in recorded_patches if p["path"] == "/attributes/fulfillment_availability")
+    assert inv_patch["value"][0]["quantity"] == 25
+    assert inv_patch["value"][0]["fulfillment_channel_code"] == "DEFAULT"
+    assert res["price"] == "10.50"
+    assert res["totalInventory"] == 25

@@ -166,6 +166,24 @@ async def create_indexes() -> None:
         name="userId_1_ebaySku_1",
     )
     await safe_create_index(
+        "products",
+        [("userId", ASCENDING), ("marketplace", ASCENDING), ("environment", ASCENDING), ("amazonSku", ASCENDING)],
+        unique=True,
+        partialFilterExpression={
+            "marketplace": "amazon",
+            "amazonSku": {"$exists": True, "$type": "string"},
+        },
+        name="uniq_user_amazon_sku_env",
+    )
+    await safe_create_index(
+        "products",
+        [("userId", ASCENDING), ("amazonAsin", ASCENDING)],
+        partialFilterExpression={
+            "amazonAsin": {"$exists": True, "$type": "string"},
+        },
+        name="idx_user_amazon_asin",
+    )
+    await safe_create_index(
         "inventories",
         [("userId", ASCENDING), ("inventoryItemId", ASCENDING), ("locationId", ASCENDING)],
         unique=True,

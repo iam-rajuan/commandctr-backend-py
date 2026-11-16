@@ -15,11 +15,14 @@ class AmazonListingBody(BaseModel):
     bulletPoints: list[str] = Field(default_factory=list)
     backendSearchTerms: list[str] = Field(default_factory=list)
     attributes: dict[str, Any] = Field(default_factory=dict)
-    # `gtin` is the normal catalogue path.  Amazon does not provide a general
+    # `gtin` is the normal catalogue path. Amazon does not provide a general
     # API to approve GTIN exemptions, so `no_identifier` is deliberately a
     # seller-attested/manual workflow and is validated before a write occurs.
+    # `asin` is for existing Amazon catalogue products where only an offer is attached.
     identifierMode: str = Field(default="gtin", pattern="^(gtin|asin|no_identifier)$")
     existingAsin: str | None = Field(default=None, min_length=10, max_length=10)
+    condition: str = Field(default="new_new")
+    fulfillmentChannel: str = Field(default="DEFAULT")
     exemptionConfirmed: bool = False
     exemptionBrand: str | None = None
     exemptionCategory: str | None = None
@@ -39,3 +42,21 @@ class AmazonListingBody(BaseModel):
 
 class AmazonListingUpdateBody(AmazonListingBody):
     pass
+
+
+class AmazonOfferPatchBody(BaseModel):
+    price: str | None = None
+    quantity: int | None = Field(default=None, ge=0)
+
+    @field_validator("price")
+    @classmethod
+    def validate_patch_price(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except ValueError as exc:
+            raise ValueError("Price must be a valid number.") from exc
+        if numeric < 0:
+            raise ValueError("Price must be greater than or equal to 0.")
+        return f"{numeric:.2f}"

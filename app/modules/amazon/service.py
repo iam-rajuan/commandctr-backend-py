@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import timedelta
 import json
+import logging
 import re
+from datetime import timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -13,7 +14,9 @@ from app.config import get_settings
 from app.crypto_utils import decrypt, encrypt
 from app.db import collection, now_utc, serialize
 from app.errors import ApiError
-from app.modules.amazon.schema import AmazonListingBody, AmazonListingUpdateBody
+from app.modules.amazon.schema import AmazonListingBody, AmazonListingUpdateBody, AmazonOfferPatchBody
+
+logger = logging.getLogger(__name__)
 
 SANDBOX_SELLER_ID = "AXXXXXXXXXXXX"
 CANONICAL_PRODUCT_TYPE = re.compile(r"^[A-Z0-9_]+$")
@@ -44,15 +47,58 @@ def amazon_config() -> dict[str, str]:
 
 def listing_attributes(body: AmazonListingBody, config: dict[str, str]) -> dict[str, Any]:
     marketplace_id = config["marketplaceId"]
+
     def localized(value: str) -> dict[str, str]:
         return {
             "value": value,
             "language_tag": "en_GB",
             "marketplace_id": marketplace_id,
         }
+
+    # OFFER-ONLY MODE (Existing ASIN)
+    if body.identifierMode == "asin":
+        attributes: dict[str, Any] = {
+            "merchant_suggested_asin": [{"value": body.existingAsin, "marketplace_id": marketplace_id}],
+            "condition_type": [{"value": body.condition or "new_new", "marketplace_id": marketplace_id}],
+            "list_price": [
+                {
+                    "currency": config["currency"],
+                    "value_with_tax": float(body.price),
+                    "marketplace_id": marketplace_id,
+                }
+            ],
+            "purchasable_offer": [
+                {
+                    "marketplace_id": marketplace_id,
+                    "currency": config["currency"],
+                    "our_price": [{"schedule": [{"value_with_tax": float(body.price)}]}],
+                }
+            ],
+            "fulfillment_availability": [
+                {"fulfillment_channel_code": body.fulfillmentChannel or "DEFAULT", "quantity": body.quantity}
+            ],
+        }
+        allowed_offer_attrs = {
+            "merchant_shipping_group",
+            "condition_note",
+            "lead_time_to_ship_max_days",
+            "max_order_quantity",
+            "gift_options",
+            "product_tax_code",
+            "restock_date",
+        }
+        for key, value in body.attributes.items():
+            if key in allowed_offer_attrs:
+                if isinstance(value, (str, int, float, bool)):
+                    attributes[key] = [{"value": value, "marketplace_id": marketplace_id}]
+                else:
+                    attributes[key] = value
+        return attributes
+
+    # CATALOGUE PRODUCT CREATION (GTIN or GTIN Exemption)
     attributes: dict[str, Any] = {
         "item_name": [localized(body.title)],
-        "condition_type": [{"value": "new_new", "marketplace_id": marketplace_id}],
+        "condition_type": [{"value": body.condition or "new_new", "marketplace_id": marketplace_id}],
         "list_price": [
             {
                 "currency": config["currency"],
@@ -68,7 +114,7 @@ def listing_attributes(body: AmazonListingBody, config: dict[str, str]) -> dict[
             }
         ],
         "fulfillment_availability": [
-            {"fulfillment_channel_code": "DEFAULT", "quantity": body.quantity}
+            {"fulfillment_channel_code": body.fulfillmentChannel or "DEFAULT", "quantity": body.quantity}
         ],
     }
     if body.description:
@@ -111,8 +157,11 @@ def validate_identifier_path(body: AmazonListingBody) -> None:
     identifier = body.attributes.get("externally_assigned_product_identifier")
     if body.identifierMode == "gtin" and not identifier:
         raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "A valid EAN, UPC, or GTIN is required for this identifier option.")
-    if body.identifierMode == "asin" and not body.existingAsin:
-        raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Enter the existing Amazon ASIN for this identifier option.")
+    if body.identifierMode == "asin":
+        if not body.existingAsin:
+            raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Enter the existing Amazon ASIN for this identifier option.")
+        if len(body.existingAsin.strip()) != 10:
+            raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "ASIN must be exactly 10 characters.")
     if body.identifierMode == "no_identifier":
         if identifier or body.existingAsin:
             raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Barcode-free products must not include a GTIN or ASIN.")
@@ -124,19 +173,150 @@ def validate_identifier_path(body: AmazonListingBody) -> None:
             )
 
 
-async def product_type_definition(user_id: str, product_type: str) -> dict[str, Any]:
-    """Read the current UK schema only; it never creates or changes listings."""
+async def product_type_definition(user_id: str, product_type: str, requirements: str = "LISTING") -> dict[str, Any]:
+    """Read the current UK schema; it never creates or changes listings."""
     config = amazon_config()
     token = await connected_access_token(user_id, config)
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
             f"{config['endpoint']}/definitions/2020-09-01/productTypes/{quote(product_type, safe='')}",
-            params={"marketplaceIds": config["marketplaceId"], "requirements": "LISTING", "locale": "en_GB"},
+            params={"marketplaceIds": config["marketplaceId"], "requirements": requirements, "locale": "en_GB"},
             headers={"x-amz-access-token": token, "user-agent": "CommandCtr/0.1 (Language=Python)"},
         )
     if response.status_code >= 400:
         raise ApiError(status.HTTP_502_BAD_GATEWAY, "Amazon could not load the Product Type Definition.", {"statusCode": response.status_code})
-    return response.json()
+    data = response.json()
+
+    # If schema has an S3 pre-signed link, fetch the JSON schema
+    schema_link = data.get("schema", {}).get("link", {}).get("resource")
+    if schema_link:
+        try:
+            async with httpx.AsyncClient(timeout=30) as s3_client:
+                s3_resp = await s3_client.get(schema_link)
+                if s3_resp.status_code == 200:
+                    resolved_schema = s3_resp.json()
+                    data["resolvedSchema"] = resolved_schema
+                    if not data.get("schema", {}).get("properties"):
+                        data["schema"]["properties"] = resolved_schema.get("properties", {})
+                    if not data.get("schema", {}).get("required"):
+                        data["schema"]["required"] = resolved_schema.get("required", [])
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Failed to fetch resolved S3 schema for product type %s: %s", product_type, exc)
+    return data
+
+
+async def catalog_item_lookup(user_id: str, asin: str) -> dict[str, Any]:
+    clean_asin = asin.strip().upper()
+    if len(clean_asin) != 10:
+        raise ApiError(status.HTTP_400_BAD_REQUEST, "ASIN must be exactly 10 characters.")
+    config = amazon_config()
+    token = await connected_access_token(user_id, config)
+    url = f"{config['endpoint']}/catalog/2022-04-01/items/{clean_asin}"
+    params = {
+        "marketplaceIds": config["marketplaceId"],
+        "includedData": "summaries,attributes,images,productTypes",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"x-amz-access-token": token, "user-agent": "CommandCtr/0.1 (Language=Python)"},
+            )
+    except httpx.HTTPError as exc:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Amazon Catalog Items API.") from exc
+
+    if response.status_code == 404:
+        raise ApiError(status.HTTP_404_NOT_FOUND, f"No Amazon catalogue item found for ASIN '{clean_asin}'.")
+    if response.status_code >= 400:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Amazon Catalog Items API rejected the lookup.", {"statusCode": response.status_code, "response": response.text})
+
+    data = response.json()
+    summaries = data.get("summaries") or []
+    summary = summaries[0] if summaries else {}
+    product_types = data.get("productTypes") or []
+    resolved_pt = product_types[0].get("productType") if product_types else "PRODUCT"
+
+    images_raw = data.get("images") or []
+    image_list: list[dict[str, Any]] = []
+    main_image_url: str | None = None
+    if images_raw and isinstance(images_raw, list):
+        for img_group in images_raw:
+            for item in img_group.get("images") or []:
+                link = item.get("link")
+                if link:
+                    variant = item.get("variant", "MAIN")
+                    image_list.append({
+                        "link": link,
+                        "variant": variant,
+                        "height": item.get("height"),
+                        "width": item.get("width"),
+                    })
+                    if variant == "MAIN" and not main_image_url:
+                        main_image_url = link
+        if not main_image_url and image_list:
+            main_image_url = image_list[0]["link"]
+
+    return {
+        "asin": clean_asin,
+        "title": summary.get("itemName") or "Amazon Catalog Product",
+        "brand": summary.get("brand") or summary.get("manufacturer"),
+        "manufacturer": summary.get("manufacturer"),
+        "color": summary.get("color"),
+        "itemClassification": summary.get("itemClassification"),
+        "productType": resolved_pt,
+        "imageUrl": main_image_url,
+        "images": image_list,
+        "marketplaceId": config["marketplaceId"],
+    }
+
+
+async def check_restrictions(user_id: str, asin: str, condition_type: str = "new_new") -> dict[str, Any]:
+    clean_asin = asin.strip().upper()
+    if len(clean_asin) != 10:
+        raise ApiError(status.HTTP_400_BAD_REQUEST, "ASIN must be exactly 10 characters.")
+    config = amazon_config()
+    token = await connected_access_token(user_id, config)
+    url = f"{config['endpoint']}/listings/2021-08-01/restrictions"
+    params = {
+        "asin": clean_asin,
+        "sellerId": config["sellerId"],
+        "marketplaceIds": config["marketplaceId"],
+        "conditionType": condition_type,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                url,
+                params=params,
+                headers={"x-amz-access-token": token, "user-agent": "CommandCtr/0.1 (Language=Python)"},
+            )
+    except httpx.HTTPError as exc:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Amazon Listings Restrictions API.") from exc
+
+    if response.status_code >= 400:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Amazon Listings Restrictions API returned an error.", {"statusCode": response.status_code, "response": response.text})
+
+    data = response.json()
+    restrictions = data.get("restrictions") or []
+    reasons_list: list[dict[str, Any]] = []
+    for r in restrictions:
+        for reason in r.get("reasons") or []:
+            reasons_list.append({
+                "reasonCode": reason.get("reasonCode"),
+                "message": reason.get("message"),
+                "links": reason.get("links") or [],
+            })
+
+    is_restricted = len(restrictions) > 0
+    return {
+        "asin": clean_asin,
+        "conditionType": condition_type,
+        "restricted": is_restricted,
+        "eligible": not is_restricted,
+        "restrictions": restrictions,
+        "reasons": reasons_list,
+    }
 
 
 async def connected_access_token(user_id: str, config: dict[str, str]) -> str:
@@ -146,7 +326,27 @@ async def connected_access_token(user_id: str, config: dict[str, str]) -> str:
     )
     if not connection or connection.get("status") != "connected" or not connection.get("refreshTokenEncrypted"):
         raise ApiError(status.HTTP_400_BAD_REQUEST, f"Connect Amazon {config['environment']} before publishing a product.")
+
+    expires_at = connection.get("accessTokenExpiresAt")
+    cached_token_enc = connection.get("accessTokenEncrypted")
+    if expires_at and cached_token_enc and expires_at > (now_utc() + timedelta(seconds=60)):
+        try:
+            return decrypt(cached_token_enc)
+        except (ValueError, KeyError) as exc:
+            logger.warning("Failed to decrypt cached access token: %s", exc)
+
     token = await exchange_access_token(decrypt(connection["refreshTokenEncrypted"]), config)
+    now = now_utc()
+    await collection("marketplaceconnections").update_one(
+        {"_id": connection["_id"]},
+        {
+            "$set": {
+                "accessTokenEncrypted": encrypt(token["access_token"]),
+                "accessTokenExpiresAt": now + timedelta(seconds=int(token.get("expires_in", 3600))),
+                "lastCheckedAt": now,
+            }
+        },
+    )
     return str(token["access_token"])
 
 
@@ -233,9 +433,10 @@ async def listings_request(
 
 
 def listing_submission(body: AmazonListingBody, config: dict[str, str]) -> dict[str, Any]:
+    requirements = "LISTING_OFFER_ONLY" if body.identifierMode == "asin" else "LISTING"
     return {
         "productType": body.productType,
-        "requirements": "LISTING",
+        "requirements": requirements,
         "attributes": listing_attributes(body, config),
     }
 
@@ -262,7 +463,41 @@ async def validate_listing(user_id: str, body: AmazonListingBody) -> dict[str, A
     return preview
 
 
+async def validate_listing_preview(user_id: str, body: AmazonListingBody) -> dict[str, Any]:
+    validate_identifier_path(body)
+    config = amazon_config()
+    resolved_body = await resolve_product_type(user_id, body)
+    if config["environment"] != "production":
+        return {
+            "valid": True,
+            "status": "ACCEPTED",
+            "issues": [],
+            "sku": resolved_body.sku,
+            "productType": resolved_body.productType,
+            "environment": config["environment"],
+        }
+    preview = await listings_request(
+        user_id,
+        "PUT",
+        resolved_body.sku,
+        body=listing_submission(resolved_body, config),
+        validation_preview=True,
+    )
+    issues = preview.get("issues") or []
+    has_blocking_error = preview.get("status") == "INVALID" or any(issue.get("severity") == "ERROR" for issue in issues)
+    return {
+        "valid": not has_blocking_error,
+        "status": preview.get("status", "ACCEPTED" if not has_blocking_error else "INVALID"),
+        "issues": issues,
+        "sku": resolved_body.sku,
+        "productType": resolved_body.productType,
+        "environment": config["environment"],
+    }
+
+
 def local_listing_document(body: AmazonListingBody, response: dict[str, Any], config: dict[str, str]) -> dict[str, Any]:
+    asin = body.existingAsin if body.identifierMode == "asin" else None
+    listing_url = f"https://www.amazon.co.uk/dp/{asin}" if asin else None
     return {
         "marketplace": "amazon",
         "environment": config["environment"],
@@ -270,6 +505,10 @@ def local_listing_document(body: AmazonListingBody, response: dict[str, Any], co
         "amazonSellerId": config["sellerId"],
         "amazonMarketplaceId": config["marketplaceId"],
         "amazonSku": body.sku,
+        "amazonAsin": asin,
+        "amazonCondition": body.condition,
+        "amazonFulfillmentChannel": body.fulfillmentChannel,
+        "amazonListingUrl": listing_url,
         "amazonSubmissionId": response.get("submissionId"),
         "amazonStatus": response.get("status", "ACCEPTED"),
         "amazonIssues": response.get("issues") or [],
@@ -286,6 +525,8 @@ def local_listing_document(body: AmazonListingBody, response: dict[str, Any], co
             "bulletPoints": body.bulletPoints,
             "backendSearchTerms": body.backendSearchTerms,
             "attributes": body.attributes,
+            "identifierMode": body.identifierMode,
+            "existingAsin": body.existingAsin,
         },
         "lastAmazonSyncAt": now_utc(),
     }
@@ -351,6 +592,93 @@ async def update_listing(user_id: str, product_id: str, body: AmazonListingUpdat
     update = local_listing_document(body, response, config) | {"updatedAt": now_utc()}
     saved = await collection("products").find_one_and_update(
         {"_id": product["_id"], "userId": user_id}, {"$set": update}, return_document=True
+    )
+    return serialize(saved)
+
+
+async def patch_listing_offer(user_id: str, product_id: str, body: AmazonOfferPatchBody) -> dict[str, Any]:
+    from app.db import oid
+
+    config = amazon_config()
+    product = await collection("products").find_one(
+        {
+            "_id": oid(product_id),
+            "userId": user_id,
+            "marketplace": "amazon",
+            "environment": config["environment"],
+        }
+    )
+    if not product:
+        raise ApiError(status.HTTP_404_NOT_FOUND, f"Amazon {config['environment']} product not found.")
+
+    sku = str(product.get("amazonSku"))
+    product_type = str(product.get("productType") or "PRODUCT")
+    patches: list[dict[str, Any]] = []
+
+    if body.price is not None:
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/purchasable_offer",
+            "value": [
+                {
+                    "marketplace_id": config["marketplaceId"],
+                    "currency": config["currency"],
+                    "our_price": [{"schedule": [{"value_with_tax": float(body.price)}]}],
+                }
+            ],
+        })
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/list_price",
+            "value": [
+                {
+                    "currency": config["currency"],
+                    "value_with_tax": float(body.price),
+                    "marketplace_id": config["marketplaceId"],
+                }
+            ],
+        })
+
+    if body.quantity is not None:
+        fulfillment_code = product.get("amazonFulfillmentChannel") or "DEFAULT"
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/fulfillment_availability",
+            "value": [
+                {
+                    "fulfillment_channel_code": fulfillment_code,
+                    "quantity": body.quantity,
+                }
+            ],
+        })
+
+    if not patches:
+        raise ApiError(status.HTTP_400_BAD_REQUEST, "At least one of price or quantity must be provided.")
+
+    patch_payload = {
+        "productType": product_type,
+        "patches": patches,
+    }
+
+    response = await listings_request(user_id, "PATCH", sku, body=patch_payload)
+
+    update_doc: dict[str, Any] = {
+        "lastAmazonSyncAt": now_utc(),
+        "amazonStatus": response.get("status", "ACCEPTED"),
+        "amazonIssues": response.get("issues") or [],
+        "updatedAt": now_utc(),
+    }
+    if body.price is not None:
+        update_doc["price"] = body.price
+        update_doc["variants.0.price"] = body.price
+    if body.quantity is not None:
+        update_doc["totalInventory"] = body.quantity
+        update_doc["variants.0.inventoryQuantity"] = body.quantity
+
+    saved = await collection("products").find_one_and_update(
+        {"_id": product["_id"], "userId": user_id},
+        {"$set": update_doc},
+        return_document=True,
     )
     return serialize(saved)
 
