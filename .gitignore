@@ -2,10 +2,11 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
-.env
 *.pyc
 dist/
 build/
 *.egg-info/
 branch_structure.json
 .gitignore
+config.bat
+node_modules

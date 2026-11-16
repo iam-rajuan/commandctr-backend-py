@@ -255,6 +255,13 @@ def map_product(user_id: str, node: dict[str, Any]) -> dict[str, Any]:
     return {"userId": user_id, "marketplace": "shopify", "shopifyProductId": node.get("id"), "title": node.get("title"), "description": node.get("descriptionHtml", ""), "handle": node.get("handle"), "vendor": node.get("vendor", ""), "productType": node.get("productType", ""), "status": node.get("status", ""), "tags": node.get("tags") or [], "totalInventory": node.get("totalInventory") or 0, "featuredImage": image, "images": [i for i in images if i], "variants": [{"shopifyVariantId": v.get("id"), "title": v.get("title"), "sku": v.get("sku", ""), "price": v.get("price", ""), "compareAtPrice": v.get("compareAtPrice", ""), "inventoryQuantity": v.get("inventoryQuantity") or 0, "inventoryItemId": (v.get("inventoryItem") or {}).get("id", "")} for v in variants], "rawShopifyData": node, "lastSyncedAt": now_utc()}
 
 
+def product_content_differs(existing: dict[str, Any], mapped: dict[str, Any]) -> bool:
+    for key in ("title", "description", "handle", "vendor", "productType", "status", "tags", "featuredImage", "images", "variants"):
+        if existing.get(key) != mapped.get(key):
+            return True
+    return False
+
+
 PRODUCT_FIELDS = """id title descriptionHtml handle vendor productType status tags totalInventory featuredImage { url } media(first: 20) { nodes { preview { image { url } } ... on MediaImage { image { url } } } } variants(first: 50) { nodes { id title sku price compareAtPrice inventoryQuantity inventoryItem { id } } }"""
 PRODUCT_QUERY = f"""query {{ products(first: 100) {{ nodes {{ {PRODUCT_FIELDS} }} }} }}"""
 PRODUCT_BY_ID_QUERY = f"""query ProductById($id: ID!) {{ product(id: $id) {{ {PRODUCT_FIELDS} }} }}"""
@@ -450,11 +457,17 @@ async def upsert_shopify_product_snapshot(user_id: str, product_id: str | None) 
         return None
 
     mapped = map_product(user_id, node)
-    await collection("products").update_one(
-        {"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]},
-        {"$set": mapped | {"updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}},
-        upsert=True,
-    )
+    existing = await collection("products").find_one({"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]})
+    if existing:
+        update_fields = mapped.copy()
+        if product_content_differs(existing, mapped):
+            update_fields["updatedAt"] = now_utc()
+        else:
+            update_fields["updatedAt"] = existing.get("updatedAt", mapped.get("lastSyncedAt"))
+        await collection("products").update_one({"_id": existing["_id"]}, {"$set": update_fields})
+    else:
+        now = now_utc()
+        await collection("products").insert_one(mapped | {"createdAt": now, "updatedAt": now})
     for variant in mapped["variants"]:
         if variant.get("inventoryItemId"):
             await collection("inventories").update_one(
@@ -506,9 +519,19 @@ async def sync_shopify_products_for_user(user_id: str) -> dict[str, int]:
     for node in nodes:
         mapped = map_product(user_id, node)
         live_keys.extend([v.get("inventoryItemId") + "::" for v in mapped["variants"] if v.get("inventoryItemId")])
-        result = await collection("products").update_one({"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]}, {"$set": mapped | {"updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
-        imported += int(bool(result.upserted_id))
-        updated += int(not result.upserted_id)
+        existing = await collection("products").find_one({"userId": user_id, "shopifyProductId": mapped["shopifyProductId"]})
+        if existing:
+            update_fields = mapped.copy()
+            if product_content_differs(existing, mapped):
+                update_fields["updatedAt"] = now_utc()
+            else:
+                update_fields["updatedAt"] = existing.get("updatedAt", mapped.get("lastSyncedAt"))
+            await collection("products").update_one({"_id": existing["_id"]}, {"$set": update_fields})
+            updated += 1
+        else:
+            now = now_utc()
+            await collection("products").insert_one(mapped | {"createdAt": now, "updatedAt": now})
+            imported += 1
         for variant in mapped["variants"]:
             if variant.get("inventoryItemId"):
                 await collection("inventories").update_one({"userId": user_id, "inventoryItemId": variant["inventoryItemId"], "locationId": ""}, {"$set": {"userId": user_id, "marketplace": "shopify", "shopifyProductId": mapped["shopifyProductId"], "shopifyVariantId": variant.get("shopifyVariantId"), "inventoryItemId": variant["inventoryItemId"], "sku": variant.get("sku"), "title": f"{mapped['title']} - {variant.get('title')}", "shopifyQuantity": variant.get("inventoryQuantity", 0), "availableQuantity": variant.get("inventoryQuantity", 0), "isActive": True, "sourceStatus": "active", "lastSyncedAt": now_utc(), "updatedAt": now_utc()}, "$setOnInsert": {"createdAt": now_utc()}}, upsert=True)
