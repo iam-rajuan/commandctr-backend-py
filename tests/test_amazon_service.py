@@ -422,3 +422,112 @@ async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
     assert inv_patch["value"][0]["fulfillment_channel_code"] == "DEFAULT"
     assert res["price"] == "10.50"
     assert res["totalInventory"] == 25
+
+
+def test_to_utc_datetime_normalizes_naive_and_aware():
+    from datetime import UTC, datetime, timedelta, timezone
+
+    from app.db import to_utc_datetime
+
+    # 1. Naive datetime (e.g. from MongoDB legacy or default BSON decode)
+    naive_dt = datetime(2026, 11, 16, 12, 0, 0)  # noqa: DTZ001
+    aware_res = to_utc_datetime(naive_dt)
+    assert aware_res is not None
+    assert aware_res.tzinfo == UTC
+    assert aware_res.year == 2026 and aware_res.hour == 12
+
+    # 2. Aware UTC datetime
+    utc_dt = datetime(2026, 11, 16, 12, 0, 0, tzinfo=UTC)
+    res_utc = to_utc_datetime(utc_dt)
+    assert res_utc == utc_dt
+
+    # 3. Aware non-UTC datetime (e.g. UTC+6)
+    tz_plus_6 = timezone(timedelta(hours=6))
+    dt_plus_6 = datetime(2026, 11, 16, 18, 0, 0, tzinfo=tz_plus_6)
+    res_converted = to_utc_datetime(dt_plus_6)
+    assert res_converted is not None
+    assert res_converted.tzinfo == UTC
+    assert res_converted.hour == 12
+
+    # 4. ISO string
+    res_str = to_utc_datetime("2026-11-16T12:00:00Z")
+    assert res_str is not None
+    assert res_str.tzinfo == UTC
+    assert res_str.hour == 12
+
+    # 5. None / Invalid
+    assert to_utc_datetime(None) is None
+    assert to_utc_datetime("invalid-date") is None
+    assert to_utc_datetime(12345) is None
+
+
+@pytest.mark.asyncio
+async def test_connected_access_token_handles_naive_and_aware_datetimes(monkeypatch):
+    from datetime import UTC, datetime, timedelta
+
+    from bson import ObjectId
+
+    from app.crypto_utils import encrypt
+
+    config = {
+        "environment": "production",
+        "endpoint": "https://sellingpartnerapi-eu.amazon.com",
+        "marketplaceId": "A1F83G8C2ARO7P",
+        "currency": "GBP",
+        "sellerId": "A1TESTSELLER",
+        "clientId": "client-id",
+        "clientSecret": "client-secret",
+        "refreshToken": "refresh-token",
+    }
+
+    # Case A: Naive future expiration from MongoDB -> Reuses cached token without TypeError
+    naive_future = datetime.now(UTC).replace(tzinfo=None) + timedelta(hours=1)
+    fake_conn_naive = {
+        "_id": ObjectId(),
+        "userId": "user-1",
+        "status": "connected",
+        "refreshTokenEncrypted": encrypt("my-refresh-token"),
+        "accessTokenEncrypted": encrypt("cached-valid-token"),
+        "accessTokenExpiresAt": naive_future,  # Naive datetime!
+    }
+
+    class FakeConnCollection:
+        def __init__(self, doc):
+            self.doc = doc
+            self.updated = False
+
+        async def find_one(self, *args, **kwargs):
+            return self.doc
+
+        async def update_one(self, *args, **kwargs):
+            self.updated = True
+
+    coll_naive = FakeConnCollection(fake_conn_naive)
+    monkeypatch.setattr(service, "collection", lambda name: coll_naive)
+
+    token = await service.connected_access_token("user-1", config)
+    assert token == "cached-valid-token"
+    assert coll_naive.updated is False
+
+    # Case B: Expired naive datetime -> Triggers refresh
+    naive_past = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=1)
+    fake_conn_expired = {
+        "_id": ObjectId(),
+        "userId": "user-1",
+        "status": "connected",
+        "refreshTokenEncrypted": encrypt("my-refresh-token"),
+        "accessTokenEncrypted": encrypt("cached-expired-token"),
+        "accessTokenExpiresAt": naive_past,
+    }
+    coll_expired = FakeConnCollection(fake_conn_expired)
+    monkeypatch.setattr(service, "collection", lambda name: coll_expired)
+
+    async def fake_exchange(*args, **kwargs):
+        return {"access_token": "newly-refreshed-token", "expires_in": 3600}
+
+    monkeypatch.setattr(service, "exchange_access_token", fake_exchange)
+
+    new_token = await service.connected_access_token("user-1", config)
+    assert new_token == "newly-refreshed-token"
+    assert coll_expired.updated is True
+

@@ -12,7 +12,7 @@ from starlette import status
 
 from app.config import get_settings
 from app.crypto_utils import decrypt, encrypt
-from app.db import collection, now_utc, serialize
+from app.db import collection, now_utc, serialize, to_utc_datetime
 from app.errors import ApiError
 from app.modules.amazon.schema import AmazonListingBody, AmazonListingUpdateBody, AmazonOfferPatchBody
 
@@ -327,7 +327,7 @@ async def connected_access_token(user_id: str, config: dict[str, str]) -> str:
     if not connection or connection.get("status") != "connected" or not connection.get("refreshTokenEncrypted"):
         raise ApiError(status.HTTP_400_BAD_REQUEST, f"Connect Amazon {config['environment']} before publishing a product.")
 
-    expires_at = connection.get("accessTokenExpiresAt")
+    expires_at = to_utc_datetime(connection.get("accessTokenExpiresAt"))
     cached_token_enc = connection.get("accessTokenEncrypted")
     if expires_at and cached_token_enc and expires_at > (now_utc() + timedelta(seconds=60)):
         try:

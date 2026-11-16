@@ -20,6 +20,25 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
+def to_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    if isinstance(value, str):
+        try:
+            cleaned = value.strip().replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
+        except ValueError:
+            return None
+    return None
+
+
 def oid(value: str) -> ObjectId:
     try:
         return ObjectId(value)
