@@ -196,6 +196,7 @@ def test_offer_only_listing_submission_uses_existing_asin_and_offer_requirements
     assert "product_description" not in payload["attributes"]
     assert "brand" not in payload["attributes"]
     assert "bullet_point" not in payload["attributes"]
+    assert "list_price" not in payload["attributes"]
     assert "externally_assigned_product_identifier" not in payload["attributes"]
 
 
@@ -333,6 +334,89 @@ async def test_validate_listing_preview_returns_structured_result(monkeypatch):
     assert res["issues"] == []
     assert res["sku"] == "SKU-NOTEBOOK-001"
     assert res["productType"] == "ABIS_BOOK"
+
+
+@pytest.mark.asyncio
+async def test_validate_listing_allows_warnings_and_does_not_raise_422(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = AmazonListingBody(
+        title="NOTEBOOK BASIC",
+        sku="SKU-NOTEBOOK-001",
+        price="8.99",
+        quantity=5,
+        productType="ABIS_BOOK",
+        identifierMode="asin",
+        existingAsin="B09TDW5M2C",
+    )
+
+    warning_issue = {
+        "code": "90000900",
+        "severity": "WARNING",
+        "message": "Attribute [list_price] is not applicable for this listing mode and will be ignored.",
+        "attributeNames": ["list_price"],
+    }
+
+    async def fake_request(*_args, **kwargs):
+        assert kwargs.get("validation_preview") is True
+        return {"status": "ACCEPTED", "issues": [warning_issue]}
+
+    monkeypatch.setattr(service, "listings_request", fake_request)
+
+    # 1. validate_listing must NOT raise HTTP 422 for a WARNING!
+    preview = await service.validate_listing("user-1", body)
+    assert preview["status"] == "ACCEPTED"
+    assert len(preview["issues"]) == 1
+
+    # 2. validate_listing_preview returns valid=True and categorizes warningIssues
+    preview_res = await service.validate_listing_preview("user-1", body)
+    assert preview_res["valid"] is True
+    assert preview_res["status"] == "ACCEPTED"
+    assert len(preview_res["warningIssues"]) == 1
+    assert preview_res["warningIssues"][0]["code"] == "90000900"
+    assert len(preview_res["errorIssues"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_validate_listing_blocks_on_error_severity_or_invalid_status(monkeypatch):
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    body = AmazonListingBody(
+        title="NOTEBOOK BASIC",
+        sku="SKU-NOTEBOOK-001",
+        price="8.99",
+        quantity=5,
+        productType="ABIS_BOOK",
+        identifierMode="asin",
+        existingAsin="B09TDW5M2C",
+    )
+
+    error_issue = {
+        "code": "4000001",
+        "severity": "ERROR",
+        "message": "Missing required offer attribute [purchasable_offer].",
+        "attributeNames": ["purchasable_offer"],
+    }
+
+    async def fake_request(*_args, **kwargs):
+        assert kwargs.get("validation_preview") is True
+        return {"status": "INVALID", "issues": [error_issue]}
+
+    monkeypatch.setattr(service, "listings_request", fake_request)
+
+    # 1. validate_listing MUST raise HTTP 422 with Amazon issue details
+    with pytest.raises(ApiError) as exc:
+        await service.validate_listing("user-1", body)
+    assert exc.value.status_code == 422
+    assert "Code 4000001" in exc.value.message
+    assert "purchasable_offer" in exc.value.message
+    assert exc.value.details["status"] == "INVALID"
+    assert len(exc.value.details["errorIssues"]) == 1
+
+    # 2. validate_listing_preview returns valid=False without raising ApiError
+    preview_res = await service.validate_listing_preview("user-1", body)
+    assert preview_res["valid"] is False
+    assert preview_res["status"] == "INVALID"
+    assert len(preview_res["errorIssues"]) == 1
+    assert preview_res["errorIssues"][0]["code"] == "4000001"
 
 
 def test_local_listing_document_stores_amazon_asin_and_condition(monkeypatch):

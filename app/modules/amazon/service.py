@@ -60,13 +60,6 @@ def listing_attributes(body: AmazonListingBody, config: dict[str, str]) -> dict[
         attributes: dict[str, Any] = {
             "merchant_suggested_asin": [{"value": body.existingAsin, "marketplace_id": marketplace_id}],
             "condition_type": [{"value": body.condition or "new_new", "marketplace_id": marketplace_id}],
-            "list_price": [
-                {
-                    "currency": config["currency"],
-                    "value_with_tax": float(body.price),
-                    "marketplace_id": marketplace_id,
-                }
-            ],
             "purchasable_offer": [
                 {
                     "marketplace_id": marketplace_id,
@@ -454,11 +447,27 @@ async def validate_listing(user_id: str, body: AmazonListingBody) -> dict[str, A
         validation_preview=True,
     )
     issues = preview.get("issues") or []
-    if preview.get("status") == "INVALID" or any(issue.get("severity") == "ERROR" for issue in issues):
+    error_issues = [i for i in issues if str(i.get("severity", "")).upper() == "ERROR"]
+    has_blocking_error = preview.get("status") == "INVALID" or len(error_issues) > 0
+    if has_blocking_error:
+        issue_details = []
+        for iss in (error_issues or issues):
+            code = iss.get("code") or "UNKNOWN"
+            sev = iss.get("severity") or "ERROR"
+            msg = iss.get("message") or "Unknown validation issue"
+            attrs = iss.get("attributeNames") or []
+            attr_str = f" (attribute: {', '.join(attrs)})" if attrs else ""
+            issue_details.append(f"[{sev}] Code {code}{attr_str}: {msg}")
         raise ApiError(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Amazon rejected the listing validation preview. Correct the reported attributes before publishing.",
-            {"status": preview.get("status", "INVALID"), "issues": issues},
+            f"Amazon rejected the listing validation preview. Correct the reported errors before publishing: {'; '.join(issue_details)}",
+            {
+                "status": preview.get("status", "INVALID"),
+                "issues": issues,
+                "errorIssues": error_issues,
+                "warningIssues": [i for i in issues if str(i.get("severity", "")).upper() == "WARNING"],
+                "infoIssues": [i for i in issues if str(i.get("severity", "")).upper() == "INFO"],
+            },
         )
     return preview
 
@@ -472,6 +481,9 @@ async def validate_listing_preview(user_id: str, body: AmazonListingBody) -> dic
             "valid": True,
             "status": "ACCEPTED",
             "issues": [],
+            "errorIssues": [],
+            "warningIssues": [],
+            "infoIssues": [],
             "sku": resolved_body.sku,
             "productType": resolved_body.productType,
             "environment": config["environment"],
@@ -484,11 +496,17 @@ async def validate_listing_preview(user_id: str, body: AmazonListingBody) -> dic
         validation_preview=True,
     )
     issues = preview.get("issues") or []
-    has_blocking_error = preview.get("status") == "INVALID" or any(issue.get("severity") == "ERROR" for issue in issues)
+    error_issues = [i for i in issues if str(i.get("severity", "")).upper() == "ERROR"]
+    warning_issues = [i for i in issues if str(i.get("severity", "")).upper() == "WARNING"]
+    info_issues = [i for i in issues if str(i.get("severity", "")).upper() == "INFO"]
+    has_blocking_error = preview.get("status") == "INVALID" or len(error_issues) > 0
     return {
         "valid": not has_blocking_error,
         "status": preview.get("status", "ACCEPTED" if not has_blocking_error else "INVALID"),
         "issues": issues,
+        "errorIssues": error_issues,
+        "warningIssues": warning_issues,
+        "infoIssues": info_issues,
         "sku": resolved_body.sku,
         "productType": resolved_body.productType,
         "environment": config["environment"],
