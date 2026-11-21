@@ -75,6 +75,16 @@ async def patch_amazon_offer(product_id: str, body: AmazonOfferPatchBody, user=D
     return success("Amazon offer updated successfully.", listing)
 
 
+@router.post("/listings/{product_id}/sync")
+async def sync_amazon_listing(product_id: str, user=Depends(current_user)):
+    return success("Amazon listing synchronized successfully.", await service.sync_listing(user["userId"], product_id))
+
+
+@router.post("/listings/sync")
+async def sync_amazon_listings(user=Depends(current_user)):
+    return success("Amazon listing synchronization completed.", await service.sync_listings(user["userId"]))
+
+
 @router.patch("/listings/{product_id}")
 async def update_amazon_listing(product_id: str, body: AmazonListingUpdateBody, user=Depends(current_user)):
     listing = await service.update_listing(user["userId"], product_id, body)

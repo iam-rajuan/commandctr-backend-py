@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_SELLER_ID = "AXXXXXXXXXXXX"
 CANONICAL_PRODUCT_TYPE = re.compile(r"^[A-Z0-9_]+$")
+OFFER_UPDATE_RETRIES = 3
+FBM_FULFILLMENT_CHANNEL = "DEFAULT"
+_offer_update_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
 def amazon_config() -> dict[str, str]:
@@ -389,29 +393,35 @@ async def listings_request(
     *,
     body: dict[str, Any] | None = None,
     validation_preview: bool = False,
+    included_data: str | None = None,
 ) -> dict[str, Any]:
     config = amazon_config()
     access_token = await connected_access_token(user_id, config)
     url = f"{config['endpoint']}/listings/2021-08-01/items/{quote(config['sellerId'], safe='')}/{quote(sku, safe='')}"
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            params = {"marketplaceIds": config["marketplaceId"], "issueLocale": "en_GB"}
-            if validation_preview:
-                params["mode"] = "VALIDATION_PREVIEW"
-            response = await client.request(
-                method,
-                url,
-                params=params,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-amz-access-token": access_token,
-                    "x-amz-date": now_utc().strftime("%Y%m%dT%H%M%SZ"),
-                    "user-agent": "CommandCtr/0.1 (Language=Python)",
-                },
-                json=body,
-            )
-    except httpx.HTTPError as exc:
-        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Amazon SP-API.") from exc
+    params = {"marketplaceIds": config["marketplaceId"], "issueLocale": "en_GB"}
+    if validation_preview:
+        params["mode"] = "VALIDATION_PREVIEW"
+    if included_data:
+        params["includedData"] = included_data
+    response: httpx.Response | None = None
+    for attempt in range(OFFER_UPDATE_RETRIES):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.request(
+                    method, url, params=params,
+                    headers={"Content-Type": "application/json", "x-amz-access-token": access_token, "x-amz-date": now_utc().strftime("%Y%m%dT%H%M%SZ"), "user-agent": "CommandCtr/0.1 (Language=Python)"},
+                    json=body,
+                )
+        except httpx.HTTPError as exc:
+            if attempt + 1 == OFFER_UPDATE_RETRIES:
+                raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Amazon SP-API.") from exc
+            await asyncio.sleep(0.25 * (2 ** attempt))
+            continue
+        if response.status_code not in {429, 500, 503} or attempt + 1 == OFFER_UPDATE_RETRIES:
+            break
+        await asyncio.sleep(0.25 * (2 ** attempt))
+    if response is None:
+        raise ApiError(status.HTTP_502_BAD_GATEWAY, "Failed to communicate with Amazon SP-API.")
     try:
         payload = response.json()
     except ValueError:
@@ -423,6 +433,55 @@ async def listings_request(
             message = errors[0].get("message") or message
         raise ApiError(status.HTTP_502_BAD_GATEWAY, message, {"statusCode": response.status_code, "response": payload})
     return payload if isinstance(payload, dict) else {}
+
+
+def _first_mapping(values: Any) -> dict[str, Any]:
+    return values[0] if isinstance(values, list) and values and isinstance(values[0], dict) else {}
+
+
+def _remote_listing_status(summary: dict[str, Any], issues: list[dict[str, Any]]) -> str:
+    actions = {str(action).upper() for issue in issues for action in issue.get("enforcementActions") or []}
+    if "SEARCH_SUPPRESSED" in actions:
+        return "SUPPRESSED"
+    if any(str(issue.get("severity", "")).upper() == "ERROR" for issue in issues):
+        return "ISSUES"
+    statuses = {str(value).upper() for value in summary.get("status") or []}
+    if "BUYABLE" in statuses:
+        return "ACTIVE"
+    if "INACTIVE" in statuses:
+        return "INACTIVE"
+    return "PROCESSING"
+
+
+def _remote_listing_update(product: dict[str, Any], remote: dict[str, Any]) -> dict[str, Any]:
+    summary = _first_mapping(remote.get("summaries"))
+    issues = [issue for issue in remote.get("issues") or [] if isinstance(issue, dict)]
+    offers = remote.get("offers") or []
+    offer = next((candidate for candidate in offers if isinstance(candidate, dict) and candidate.get("marketplaceId") == product.get("amazonMarketplaceId")), _first_mapping(offers))
+    price = (offer.get("price") or {}).get("amount") if isinstance(offer, dict) else None
+    availability = next((candidate for candidate in remote.get("fulfillmentAvailability") or [] if isinstance(candidate, dict) and candidate.get("fulfillmentChannelCode") == FBM_FULFILLMENT_CHANNEL), {})
+    quantity = availability.get("quantity") if isinstance(availability, dict) else None
+    asin = summary.get("asin") or product.get("amazonAsin")
+    listing_status = _remote_listing_status(summary, issues)
+    update: dict[str, Any] = {"amazonAsin": asin, "amazonStatus": listing_status, "amazonIssues": issues, "amazonRemoteSummary": summary, "amazonLastSyncError": None, "amazonOfferUpdatePending": False, "lastAmazonSyncAt": now_utc(), "updatedAt": now_utc(), "status": listing_status.lower()}
+    if summary.get("itemName"):
+        update["title"] = summary["itemName"]
+    if asin:
+        update["amazonListingUrl"] = f"https://www.amazon.co.uk/dp/{asin}"
+    if price is not None:
+        normalized_price = f"{float(price):.2f}"
+        update["price"] = normalized_price
+        update["variants.0.price"] = normalized_price
+    if quantity is not None:
+        update["totalInventory"] = int(quantity)
+        update["variants.0.inventoryQuantity"] = int(quantity)
+    return update
+
+
+async def _sync_listing_document(user_id: str, product: dict[str, Any]) -> dict[str, Any]:
+    remote = await listings_request(user_id, "GET", str(product["amazonSku"]), included_data="summaries,attributes,issues,offers,fulfillmentAvailability")
+    saved = await collection("products").find_one_and_update({"_id": product["_id"], "userId": user_id}, {"$set": _remote_listing_update(product, remote)}, return_document=True)
+    return serialize(saved)
 
 
 def listing_submission(body: AmazonListingBody, config: dict[str, str]) -> dict[str, Any]:
@@ -618,87 +677,75 @@ async def patch_listing_offer(user_id: str, product_id: str, body: AmazonOfferPa
     from app.db import oid
 
     config = amazon_config()
-    product = await collection("products").find_one(
-        {
-            "_id": oid(product_id),
-            "userId": user_id,
-            "marketplace": "amazon",
-            "environment": config["environment"],
-        }
-    )
+    lock = _offer_update_locks.setdefault((user_id, product_id), asyncio.Lock())
+    if lock.locked():
+        raise ApiError(status.HTTP_409_CONFLICT, "An Amazon offer update is already in progress for this SKU.")
+    async with lock:
+        product = await collection("products").find_one({"_id": oid(product_id), "userId": user_id, "marketplace": "amazon", "environment": config["environment"]})
+        if not product:
+            raise ApiError(status.HTTP_404_NOT_FOUND, f"Amazon {config['environment']} product not found.")
+        if body.quantity is not None and str(product.get("amazonFulfillmentChannel") or FBM_FULFILLMENT_CHANNEL).upper() != FBM_FULFILLMENT_CHANNEL:
+            raise ApiError(status.HTTP_422_UNPROCESSABLE_CONTENT, "Only seller-fulfilled (FBM) inventory can be edited from CommandCtr.")
+        patches: list[dict[str, Any]] = []
+        if body.price is not None:
+            patches.append({"op": "replace", "path": "/attributes/purchasable_offer", "value": [{"marketplace_id": config["marketplaceId"], "currency": config["currency"], "our_price": [{"schedule": [{"value_with_tax": float(body.price)}]}]}]})
+        if body.quantity is not None:
+            patches.append({"op": "replace", "path": "/attributes/fulfillment_availability", "value": [{"fulfillment_channel_code": FBM_FULFILLMENT_CHANNEL, "quantity": body.quantity}]})
+        if not patches:
+            raise ApiError(status.HTTP_400_BAD_REQUEST, "At least one of price or quantity must be provided.")
+        response = await listings_request(user_id, "PATCH", str(product["amazonSku"]), body={"productType": str(product.get("productType") or "PRODUCT"), "patches": patches})
+        update: dict[str, Any] = {"amazonStatus": response.get("status", "ACCEPTED"), "amazonIssues": response.get("issues") or [], "amazonLastSyncError": None, "updatedAt": now_utc()}
+        if body.price is not None:
+            update["price"] = body.price
+            update["variants.0.price"] = body.price
+        if body.quantity is not None:
+            update["totalInventory"] = body.quantity
+            update["variants.0.inventoryQuantity"] = body.quantity
+        saved = await collection("products").find_one_and_update({"_id": product["_id"], "userId": user_id}, {"$set": update}, return_document=True)
+        try:
+            synchronized = await _sync_listing_document(user_id, saved or product)
+            synced_variant = (synchronized.get("variants") or [{}])[0]
+            remote_price = str(synced_variant.get("price") or "")
+            remote_quantity = synced_variant.get("inventoryQuantity")
+            price_pending = body.price is not None and remote_price != body.price
+            quantity_pending = body.quantity is not None and remote_quantity != body.quantity
+            if not price_pending and not quantity_pending:
+                return synchronized
+            pending_fields = {
+                "amazonOfferUpdatePending": True,
+                "amazonLastSyncError": "Amazon accepted the update request but has not confirmed it yet. The displayed offer remains Amazon's current value.",
+                "updatedAt": now_utc(),
+            }
+            pending = await collection("products").find_one_and_update({"_id": product["_id"], "userId": user_id}, {"$set": pending_fields}, return_document=True)
+            return serialize(pending)
+        except ApiError as exc:
+            logger.warning("Amazon accepted an offer update for %s but remote confirmation is pending: %s", product["amazonSku"], exc.message)
+            fallback = await collection("products").find_one_and_update({"_id": product["_id"], "userId": user_id}, {"$set": {"amazonLastSyncError": "Amazon accepted the update; remote confirmation is pending.", "updatedAt": now_utc()}}, return_document=True)
+            return serialize(fallback)
+
+
+async def sync_listing(user_id: str, product_id: str) -> dict[str, Any]:
+    from app.db import oid
+
+    config = amazon_config()
+    product = await collection("products").find_one({"_id": oid(product_id), "userId": user_id, "marketplace": "amazon", "environment": config["environment"]})
     if not product:
         raise ApiError(status.HTTP_404_NOT_FOUND, f"Amazon {config['environment']} product not found.")
+    return await _sync_listing_document(user_id, product)
 
-    sku = str(product.get("amazonSku"))
-    product_type = str(product.get("productType") or "PRODUCT")
-    patches: list[dict[str, Any]] = []
 
-    if body.price is not None:
-        patches.append({
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [
-                {
-                    "marketplace_id": config["marketplaceId"],
-                    "currency": config["currency"],
-                    "our_price": [{"schedule": [{"value_with_tax": float(body.price)}]}],
-                }
-            ],
-        })
-        patches.append({
-            "op": "replace",
-            "path": "/attributes/list_price",
-            "value": [
-                {
-                    "currency": config["currency"],
-                    "value_with_tax": float(body.price),
-                    "marketplace_id": config["marketplaceId"],
-                }
-            ],
-        })
-
-    if body.quantity is not None:
-        fulfillment_code = product.get("amazonFulfillmentChannel") or "DEFAULT"
-        patches.append({
-            "op": "replace",
-            "path": "/attributes/fulfillment_availability",
-            "value": [
-                {
-                    "fulfillment_channel_code": fulfillment_code,
-                    "quantity": body.quantity,
-                }
-            ],
-        })
-
-    if not patches:
-        raise ApiError(status.HTTP_400_BAD_REQUEST, "At least one of price or quantity must be provided.")
-
-    patch_payload = {
-        "productType": product_type,
-        "patches": patches,
-    }
-
-    response = await listings_request(user_id, "PATCH", sku, body=patch_payload)
-
-    update_doc: dict[str, Any] = {
-        "lastAmazonSyncAt": now_utc(),
-        "amazonStatus": response.get("status", "ACCEPTED"),
-        "amazonIssues": response.get("issues") or [],
-        "updatedAt": now_utc(),
-    }
-    if body.price is not None:
-        update_doc["price"] = body.price
-        update_doc["variants.0.price"] = body.price
-    if body.quantity is not None:
-        update_doc["totalInventory"] = body.quantity
-        update_doc["variants.0.inventoryQuantity"] = body.quantity
-
-    saved = await collection("products").find_one_and_update(
-        {"_id": product["_id"], "userId": user_id},
-        {"$set": update_doc},
-        return_document=True,
-    )
-    return serialize(saved)
+async def sync_listings(user_id: str, limit: int = 50) -> dict[str, Any]:
+    config = amazon_config()
+    products = await collection("products").find({"userId": user_id, "marketplace": "amazon", "environment": config["environment"]}).limit(limit).to_list(length=limit)
+    synced = 0
+    failed: list[dict[str, str]] = []
+    for product in products:
+        try:
+            await _sync_listing_document(user_id, product)
+            synced += 1
+        except ApiError as exc:
+            failed.append({"sku": str(product.get("amazonSku") or "unknown"), "message": exc.message})
+    return {"requested": len(products), "synced": synced, "failed": failed, "lastSyncAt": now_utc()}
 
 
 async def delete_listing(user_id: str, product_id: str) -> dict[str, Any]:

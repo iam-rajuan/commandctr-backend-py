@@ -471,8 +471,15 @@ async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
     recorded_patches = []
 
     async def fake_listings_request(_user_id, method, sku, body=None, **_kwargs):
-        assert method == "PATCH"
         assert sku == "SKU-NOTEBOOK-001"
+        if method == "GET":
+            return {
+                "summaries": [{"asin": "B09TDW5M2C", "itemName": "NOTEBOOK BASIC", "status": ["BUYABLE"]}],
+                "offers": [{"price": {"amount": "10.50"}}],
+                "fulfillmentAvailability": [{"fulfillmentChannelCode": "DEFAULT", "quantity": 25}],
+                "issues": [],
+            }
+        assert method == "PATCH"
         assert body["productType"] == "ABIS_BOOK"
         recorded_patches.extend(body["patches"])
         return {"status": "ACCEPTED", "issues": []}
@@ -482,13 +489,18 @@ async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
             return fake_product
 
         async def find_one_and_update(self, query, update, **kwargs):
-            doc = fake_product.copy()
             for k, v in update["$set"].items():
                 if k == "price":
-                    doc["price"] = v
+                    fake_product["price"] = v
                 elif k == "totalInventory":
-                    doc["totalInventory"] = v
-            return doc
+                    fake_product["totalInventory"] = v
+                elif k == "variants.0.price":
+                    fake_product["variants"][0]["price"] = v
+                elif k == "variants.0.inventoryQuantity":
+                    fake_product["variants"][0]["inventoryQuantity"] = v
+                else:
+                    fake_product[k] = v
+            return fake_product.copy()
 
     monkeypatch.setattr(service, "listings_request", fake_listings_request)
     monkeypatch.setattr(service, "collection", lambda name: FakeCollection())
@@ -496,7 +508,7 @@ async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
     body = AmazonOfferPatchBody(price="10.50", quantity=25)
     res = await service.patch_listing_offer("user-1", str(fake_id), body)
 
-    assert len(recorded_patches) == 3
+    assert len(recorded_patches) == 2
     # Check purchasable_offer patch
     offer_patch = next(p for p in recorded_patches if p["path"] == "/attributes/purchasable_offer")
     assert offer_patch["value"][0]["our_price"][0]["schedule"][0]["value_with_tax"] == 10.50
@@ -506,6 +518,48 @@ async def test_patch_listing_offer_builds_patches_and_updates_db(monkeypatch):
     assert inv_patch["value"][0]["fulfillment_channel_code"] == "DEFAULT"
     assert res["price"] == "10.50"
     assert res["totalInventory"] == 25
+
+
+@pytest.mark.asyncio
+async def test_patch_listing_offer_rejects_fba_quantity_updates(monkeypatch):
+    from bson import ObjectId
+
+    from app.modules.amazon.schema import AmazonOfferPatchBody
+
+    monkeypatch.setattr(service, "get_settings", lambda: production_settings())
+    product = {"_id": ObjectId(), "userId": "user-1", "marketplace": "amazon", "environment": "production", "amazonSku": "FBA-SKU", "amazonFulfillmentChannel": "AMAZON_UK"}
+
+    class FakeCollection:
+        async def find_one(self, *_args, **_kwargs):
+            return product
+
+    monkeypatch.setattr(service, "collection", lambda _name: FakeCollection())
+    with pytest.raises(ApiError) as exc:
+        await service.patch_listing_offer("user-1", str(product["_id"]), AmazonOfferPatchBody(quantity=2))
+    assert exc.value.status_code == 422
+
+
+def test_remote_listing_update_uses_seller_offer_and_fbm_availability():
+    product = {"amazonMarketplaceId": "A1F83G8C2ARO7P", "amazonAsin": "B09TDW5M2C"}
+    remote = {
+        "summaries": [{"asin": "B09TDW5M2C", "itemName": "NOTEBOOK BASIC", "status": ["BUYABLE"]}],
+        "offers": [{"marketplaceId": "A1F83G8C2ARO7P", "price": {"amount": "9.00"}}],
+        "fulfillmentAvailability": [{"fulfillmentChannelCode": "DEFAULT", "quantity": 12}],
+        "issues": [],
+    }
+    update = service._remote_listing_update(product, remote)
+    assert update["amazonStatus"] == "ACTIVE"
+    assert update["price"] == "9.00"
+    assert update["totalInventory"] == 12
+
+
+def test_remote_listing_update_marks_suppressed_listing_with_issues():
+    update = service._remote_listing_update(
+        {"amazonAsin": "B09TDW5M2C"},
+        {"summaries": [{"status": ["BUYABLE"]}], "issues": [{"severity": "WARNING", "enforcementActions": ["SEARCH_SUPPRESSED"]}]},
+    )
+    assert update["amazonStatus"] == "SUPPRESSED"
+    assert len(update["amazonIssues"]) == 1
 
 
 def test_to_utc_datetime_normalizes_naive_and_aware():
