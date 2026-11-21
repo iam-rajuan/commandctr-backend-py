@@ -95,3 +95,13 @@ async def update_amazon_listing(product_id: str, body: AmazonListingUpdateBody, 
 async def delete_amazon_listing(product_id: str, user=Depends(current_user)):
     result = await service.delete_listing(user["userId"], product_id)
     return success("Amazon accepted the delete and the local product was removed.", result)
+
+@router.get("/pricing/{asin}")
+async def amazon_competitive_pricing(
+    asin: str,
+    conditionType: str = Query(default="new_new"),
+    fulfillmentChannel: str = Query(default="DEFAULT"),
+    user=Depends(current_user),
+):
+    result = await service.competitive_pricing(user["userId"], asin, conditionType, fulfillmentChannel)
+    return success("Amazon UK pricing research completed", result)

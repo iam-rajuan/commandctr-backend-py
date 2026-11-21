@@ -265,6 +265,9 @@ async def catalog_item_lookup(user_id: str, asin: str) -> dict[str, Any]:
         "imageUrl": main_image_url,
         "images": image_list,
         "marketplaceId": config["marketplaceId"],
+        "attributes": {key: json.dumps(value) for key, value in (data.get("attributes") or {}).items()
+                       if key in {"model_number", "model_name", "manufacturer", "color", "size", "material",
+                                  "country_of_origin", "included_components", "item_package_quantity"}},
     }
 
 
@@ -903,3 +906,140 @@ async def disconnect(user_id: str) -> dict[str, Any]:
         return_document=True,
     )
     return status_payload(connection, config)
+
+# Amazon UK competitive offer research; suggestions never update a live listing.
+def amazon_offer_snapshot(payload: dict[str, Any], config: dict[str, str], asin: str,
+                          condition_type: str, fulfillment_channel: str) -> dict[str, Any]:
+    from math import isfinite
+    from statistics import median
+
+    expected_subconditions = {
+        "new_new": {"new"}, "used_like_new": {"mint", "like new"},
+        "used_very_good": {"very good"}, "used_good": {"good"},
+        "used_acceptable": {"acceptable"}, "refurbished_refurbished": {"refurbished"},
+    }
+    accepted = expected_subconditions.get(condition_type)
+    if accepted is None:
+        raise ApiError(422, "Unsupported offer condition for competitive pricing.")
+    identity = payload.get("Identifier") or {}
+    if (str(payload.get("ASIN") or identity.get("ASIN") or "").upper() != asin
+        or (payload.get("MarketplaceId") or payload.get("marketplaceId") or identity.get("MarketplaceId")) != config["marketplaceId"]):
+        raise ApiError(502, "Amazon pricing response did not match the requested ASIN and marketplace.")
+
+    evidence, references, seen = [], [], set()
+    exclusion_counts: dict[str, int] = {}
+    offers = payload.get("Offers") or []
+    for offer in offers:
+        reasons = []
+        subcondition = str(offer.get("SubCondition") or "").strip().lower().replace("_", " ")
+        seller = str(offer.get("SellerId") or "")
+        own = bool(offer.get("MyOffer")) or seller == config["sellerId"]
+        if own:
+            reasons.append("own_offer")
+        if not seller:
+            reasons.append("seller_missing")
+        if subcondition not in accepted:
+            reasons.append("condition_mismatch")
+        if offer.get("offerType", "B2C") != "B2C":
+            reasons.append("business_offer")
+        fulfilled = offer.get("IsFulfilledByAmazon")
+        if not isinstance(fulfilled, bool):
+            reasons.append("fulfilment_unknown")
+        elif (fulfillment_channel == "DEFAULT") == fulfilled:
+            reasons.append("fulfilment_mismatch")
+        if (offer.get("ShippingTime") or {}).get("availabilityType", "NOW") != "NOW":
+            reasons.append("not_currently_available")
+        money, shipping = offer.get("ListingPrice") or {}, offer.get("Shipping") or {}
+        amount, freight = None, None
+        try:
+            amount = float(money.get("Amount"))
+            if money.get("CurrencyCode") != "GBP" or not isfinite(amount) or amount <= 0:
+                amount = None
+        except (ValueError, TypeError):
+            amount = None
+        try:
+            freight = float(shipping.get("Amount"))
+            if shipping.get("CurrencyCode") != "GBP" or not isfinite(freight) or freight < 0:
+                freight = None
+        except (ValueError, TypeError):
+            freight = None
+        if amount is None or freight is None:
+            reasons.append("invalid_gbp_price_or_shipping")
+        key = (seller, fulfilled)
+        if seller and key in seen:
+            reasons.append("duplicate_seller")
+        if not reasons or reasons == ["fulfilment_mismatch"]:
+            seen.add(key)
+        row = {"source":"Amazon UK SP-API", "title":f"{asin} — {subcondition}",
+               "url":f"https://www.amazon.co.uk/dp/{asin}", "price":amount, "shipping":freight,
+               "delivered_price":round(amount + freight, 2) if amount is not None and freight is not None else None,
+               "currency":"GBP", "condition":condition_type, "verification_status":"api_verified",
+               "fulfilment":"FBA" if fulfilled is True else "FBM" if fulfilled is False else "Unknown",
+               "my_offer":own, "exclusion_reasons":reasons, "included_in_recommendation":False}
+        references.append(row)
+        for reason in reasons:
+            exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
+        if not reasons:
+            evidence.append(row)
+    # Cross-fulfilment observations remain visible, without automatically becoming a selling price.
+    reference_prices = [row["delivered_price"] for row in references
+                        if row["delivered_price"] is not None and not row["my_offer"]
+                        and not any(reason != "fulfilment_mismatch" for reason in row["exclusion_reasons"])]
+    reference_range = ({"minimum":min(reference_prices), "maximum":max(reference_prices),
+                        "currency":"GBP", "count":len(reference_prices), "price_basis":"delivered"}
+                       if reference_prices and config["environment"] == "production" else None)
+    prices = [item["price"] for item in evidence]
+    enough = len(prices) >= 2 and config["environment"] == "production"
+    recommendation = round(median(prices), 2) if enough else None
+    for item in evidence:
+        item["included_in_recommendation"] = enough
+    warnings = ["Item prices exclude competitor delivery charges; check your own shipping, fees, VAT and margin before accepting.",
+                "This is an on-demand suggestion. It does not change an Amazon listing or guarantee Buy Box eligibility."]
+    if config["environment"] != "production":
+        warnings.append("Sandbox offer data cannot be used as a live price recommendation.")
+    if not enough:
+        warnings.append("At least two distinct sellers with matching condition, fulfilment and GBP prices are required.")
+    return {"marketplace":"amazon", "source_mode":"amazon_sp_api" if enough else "insufficient_data",
+            "currency":"GBP", "comparable_count":len(prices), "recommended_price":recommendation,
+            "reference_offers":references, "reference_price_range":reference_range,
+            "offer_diagnostics":{"returned_count":len(offers), "qualifying_count":len(evidence), "exclusion_counts":exclusion_counts},
+            "suggested_price_range":({"minimum":min(prices), "maximum":max(prices),
+                "recommended":recommendation, "currency":"GBP", "source":"amazon_sp_api"} if enough else None),
+            "recommendation_basis":"active_asking" if enough else "insufficient_data",
+            "comparison_scope":"target_marketplace", "match_mode":"exact", "price_basis":"item",
+            "analysis_summary":(f"Median item price from {len(prices)} current Amazon UK offers for ASIN {asin}, "
+                                "matching condition and fulfilment." if enough else "Insufficient matching Amazon UK offer evidence."),
+            "market_signal":"Amazon UK active offers, not completed sales",
+            "search_queries":[], "similar_listings":evidence, "evidence":evidence, "evidence_warnings":warnings}
+
+
+async def competitive_pricing(user_id: str, asin: str, condition_type: str = "new_new",
+                              fulfillment_channel: str = "DEFAULT") -> dict[str, Any]:
+    clean = asin.strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{10}", clean):
+        raise ApiError(422, "Enter a valid 10-character ASIN.")
+    conditions = {"new_new":"New", "used_like_new":"Used", "used_very_good":"Used",
+                  "used_good":"Used", "used_acceptable":"Used", "refurbished_refurbished":"Refurbished"}
+    if condition_type not in conditions or fulfillment_channel not in {"DEFAULT", "AMAZON_EU", "AMAZON_NA"}:
+        raise ApiError(422, "Unsupported condition or fulfilment channel.")
+    config = amazon_config()
+    if config["marketplaceId"] != "A1F83G8C2ARO7P" or config["currency"] != "GBP":
+        raise ApiError(422, "This pricing workflow requires the Amazon UK marketplace and GBP.")
+    token = await connected_access_token(user_id, config)
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{config['endpoint']}/products/pricing/v0/items/{clean}/offers",
+                params={"MarketplaceId":config["marketplaceId"], "ItemCondition":conditions[condition_type],
+                        "CustomerType":"Consumer"},
+                headers={"x-amz-access-token":token, "user-agent":"CommandCtr/0.1 (Language=Python)"})
+    except httpx.HTTPError as exc:
+        raise ApiError(502, "Amazon pricing is temporarily unavailable.") from exc
+    if response.status_code >= 400:
+        raise ApiError(429 if response.status_code == 429 else 502,
+                       "Amazon Product Pricing API rejected the request. Check pricing permissions or retry later.",
+                       {"statusCode":response.status_code})
+    data = response.json().get("payload") or {}
+    if str(data.get("status") or "").lower() != "success":
+        raise ApiError(502, "Amazon returned no successful pricing result.")
+    return amazon_offer_snapshot(data, config, clean, condition_type, fulfillment_channel)
